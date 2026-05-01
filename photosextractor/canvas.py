@@ -322,10 +322,11 @@ class ImageCanvas(tk.Frame):
     def _on_root_release(self, event: tk.Event) -> None:
         """Safety-net: clean up caption drag if the canvas missed the release."""
         if self._caption_drag is not None:
-            cb = self._caption_drag["cb"]
+            cb       = self._caption_drag["cb"]
+            ocr_text = self._caption_drag.get("ocr_text")
             self._caption_drag = None
             self._tooltip.hide()
-            self._try_drop_caption(cb, event.x_root, event.y_root)
+            self._try_drop_caption(cb, event.x_root, event.y_root, ocr_text)
 
     # ── selection property (fires callback on change) ────────────────────────
 
@@ -571,17 +572,20 @@ class ImageCanvas(tk.Frame):
             return
 
         box, handle = self._hit_box(cx, cy)
-        changed = box is not self._active
-        self._active = box
         if box is not None:
+            # Clicked a photo box — select it
+            changed = box is not self._active
+            self._active = box
             self._drag = {"box": box, "handle": handle,
                           "last_cx": cx, "last_cy": cy}
+            if changed:
+                self._redraw()
         else:
-            # Empty space: start rubber-band selection
+            # Empty space: start rubber-band WITHOUT clearing the active photo box.
+            # The user may be drawing a text selection to drop on the Caption field,
+            # and we need _active to know which photo receives the OCR result.
             self._drag = None
             self._rubber_band = {"cx0": cx, "cy0": cy, "cx1": cx, "cy1": cy}
-        if changed:
-            self._redraw()
 
     def _on_drag(self, event: tk.Event) -> None:
         if self._split_pts is not None:
@@ -637,10 +641,11 @@ class ImageCanvas(tk.Frame):
             self._finish_split()
             return
         if self._caption_drag is not None:
-            cb = self._caption_drag["cb"]
+            cb       = self._caption_drag["cb"]
+            ocr_text = self._caption_drag.get("ocr_text")
             self._caption_drag = None
             self._tooltip.hide()
-            self._try_drop_caption(cb, event.x_root, event.y_root)
+            self._try_drop_caption(cb, event.x_root, event.y_root, ocr_text)
             return
         if self._rubber_band is not None:
             rb = self._rubber_band
@@ -832,26 +837,49 @@ class ImageCanvas(tk.Frame):
             self._caption_boxes.remove(cb)
         self._redraw()
 
-    def _try_drop_caption(self, cb: CaptionBox, x_root: int, y_root: int) -> None:
+    def _try_drop_caption(
+        self,
+        cb: CaptionBox,
+        x_root: int,
+        y_root: int,
+        ocr_text: Optional[str] = None,
+    ) -> None:
         """
-        Called when a designated caption box is released.
-        If the cursor is over the registered caption drop widget (the Caption
-        field in the info panel) and a photo box is active, OCR the image
-        region and store the result in the active photo's caption.
+        Called when a caption box is released.  Two drop targets are checked:
+        1. Caption field in the Photo Information panel → active photo box.
+        2. Any green photo box on the canvas → that specific photo box.
         """
-        if self._caption_drop_widget is None or self._active is None:
+        text = ocr_text if ocr_text is not None else self._ocr_region(cb)
+
+        target: Optional[PhotoBox] = None
+
+        # ── target 1: Caption text widget in the info panel ──────────────────
+        if self._caption_drop_widget is not None and self._active is not None:
+            w = self._caption_drop_widget
+            if (w.winfo_rootx() <= x_root <= w.winfo_rootx() + w.winfo_width() and
+                    w.winfo_rooty() <= y_root <= w.winfo_rooty() + w.winfo_height()):
+                target = self._active
+
+        # ── target 2: any green photo box on the canvas ───────────────────────
+        if target is None:
+            x_widget = x_root - self.canvas.winfo_rootx()
+            y_widget = y_root - self.canvas.winfo_rooty()
+            cx = self.canvas.canvasx(x_widget)
+            cy = self.canvas.canvasy(y_widget)
+            hit, _ = self._hit_box(cx, cy)
+            if hit is not None:
+                target = hit
+
+        if target is None:
             return
-        w = self._caption_drop_widget
-        wx, wy = w.winfo_rootx(), w.winfo_rooty()
-        ww, wh = w.winfo_width(), w.winfo_height()
-        if not (wx <= x_root <= wx + ww and wy <= y_root <= wy + wh):
-            return
-        text = self._ocr_region(cb)
-        self._active.meta.caption = text
+
+        target.meta.caption = text
         self._caption_boxes.remove(cb)
+        was_active = target is self._active
+        self._active = target          # selects the box; fires callback if it changed
         self._redraw()
-        if self._on_select_callback is not None:
-            self._on_select_callback(self._active)
+        if was_active and self._on_select_callback is not None:
+            self._on_select_callback(target)   # force panel refresh if already active
 
     def _ocr_region(self, cb: CaptionBox) -> str:
         """OCR the image pixels inside cb; return stripped text or error message."""
