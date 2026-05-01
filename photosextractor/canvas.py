@@ -283,6 +283,7 @@ class ImageCanvas(tk.Frame):
         self._rubber_band:   Optional[dict]                    = None   # live during LMB drag on empty canvas
         self._caption_drag:  Optional[dict]                    = None   # dragging a caption box
         self._caption_drop_widget: Optional[tk.Widget]         = None   # drop target for designated caption boxes
+        self._on_new_box_callback                               = None   # callable(PhotoBox) fired when a box is added
 
         self._build_widgets()
         self._bind_events()
@@ -349,6 +350,10 @@ class ImageCanvas(tk.Frame):
     def set_caption_drop_widget(self, widget: tk.Widget) -> None:
         """Set the widget that designated caption boxes are dropped onto for OCR."""
         self._caption_drop_widget = widget
+
+    def set_on_new_box(self, callback) -> None:
+        """Register a callable(PhotoBox) fired whenever a box is manually added."""
+        self._on_new_box_callback = callback
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -820,6 +825,8 @@ class ImageCanvas(tk.Frame):
         )
         self._last_deleted = None
         self._boxes.append(box)
+        if self._on_new_box_callback is not None:
+            self._on_new_box_callback(box)
         self._active = box
         self._redraw()
 

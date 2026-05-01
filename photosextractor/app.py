@@ -92,6 +92,12 @@ class App:
         self._info_box                           = None   # currently displayed PhotoBox
         self._info_panel_loading: bool           = False
 
+        # Track which default values have already been pushed into box metadata
+        # so we can propagate edits to boxes that still hold the old default.
+        self._applied_default_date:   str           = ""
+        self._applied_default_source: str           = ""
+        self._apply_defaults_id:      Optional[str] = None
+
         self._build_menu()
         self._build_toolbar()
         self._build_statusbar()
@@ -135,22 +141,12 @@ class App:
         self.root.config(menu=bar)
 
     def _build_toolbar(self) -> None:
-        bar = tk.Frame(self.root, bd=1, relief=tk.RAISED)
-
-        tk.Label(bar, text="Default Date:").pack(side=tk.LEFT, padx=(8, 2), pady=3)
+        # StringVars are created here so they exist before _build_info_panel runs.
+        # The visible widgets live in the info panel (top of the right-hand column).
         self._default_date_var = tk.StringVar()
-        self._date_entry = tk.Entry(bar, textvariable=self._default_date_var, width=22)
-        self._date_entry.pack(side=tk.LEFT, padx=(0, 8), pady=3)
         self._default_date_var.trace_add("write", self._on_date_changed)
-
-        tk.Label(bar, text="Default Source:").pack(side=tk.LEFT, padx=(8, 2), pady=3)
         self._default_source_var = tk.StringVar()
-        tk.Entry(bar, textvariable=self._default_source_var, width=28).pack(
-            side=tk.LEFT, padx=(0, 8), pady=3
-        )
         self._default_source_var.trace_add("write", self._on_source_changed)
-
-        bar.pack(fill=tk.X, side=tk.TOP)
 
     def _build_canvas(self) -> None:
         mid = tk.Frame(self.root)
@@ -159,6 +155,7 @@ class App:
         self._canvas = ImageCanvas(mid)
         self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._canvas.set_on_select(self._on_box_selected)
+        self._canvas.set_on_new_box(self._on_new_box)
         self._canvas.set_caption_drop_widget(self._caption_text)
 
     def _build_info_panel(self, parent: tk.Widget) -> None:
@@ -166,9 +163,24 @@ class App:
         panel.pack(side=tk.RIGHT, fill=tk.Y)
         panel.pack_propagate(False)
 
+        # ── defaults section (top of panel) ──────────────────────────────────
+        tk.Label(panel, text="Default Date:", anchor="w").pack(
+            fill=tk.X, padx=10, pady=(8, 0)
+        )
+        self._date_entry = tk.Entry(panel, textvariable=self._default_date_var)
+        self._date_entry.pack(fill=tk.X, padx=10, pady=(2, 6))
+
+        tk.Label(panel, text="Default Source:", anchor="w").pack(fill=tk.X, padx=10)
+        tk.Entry(panel, textvariable=self._default_source_var).pack(
+            fill=tk.X, padx=10, pady=(2, 8)
+        )
+
+        tk.Frame(panel, height=2, bg="black").pack(fill=tk.X, padx=0, pady=(4, 0))
+
+        # ── photo information section ─────────────────────────────────────────
         tk.Label(panel, text="Photo Information",
                  font=("TkDefaultFont", 9, "bold")).pack(
-            anchor="w", padx=10, pady=(8, 2)
+            anchor="w", padx=10, pady=(4, 2)
         )
         tk.Frame(panel, height=1, bg="#aaaaaa").pack(fill=tk.X, padx=6, pady=(0, 6))
 
@@ -255,9 +267,56 @@ class App:
             except Exception:
                 self._date_entry.config(bg="#FFB0B0")
         self._schedule_save()
+        self._schedule_apply_defaults()
 
     def _on_source_changed(self, *_) -> None:
         self._schedule_save()
+        self._schedule_apply_defaults()
+
+    # -- default propagation --------------------------------------------------
+
+    def _schedule_apply_defaults(self) -> None:
+        if self._apply_defaults_id:
+            self.root.after_cancel(self._apply_defaults_id)
+        self._apply_defaults_id = self.root.after(500, self._propagate_defaults)
+
+    def _propagate_defaults(self) -> None:
+        """Push changed defaults into every box whose field is empty or held the old default."""
+        new_date   = self._default_date_var.get().strip()
+        new_source = self._default_source_var.get().strip()
+        old_date   = self._applied_default_date
+        old_source = self._applied_default_source
+
+        changed = False
+        for box in self._canvas.get_boxes():
+            if new_date and new_date != old_date:
+                if not box.meta.date or box.meta.date == old_date:
+                    box.meta.date = new_date
+                    changed = True
+            if new_source and new_source != old_source:
+                if not box.meta.source or box.meta.source == old_source:
+                    box.meta.source = new_source
+                    changed = True
+
+        self._applied_default_date   = new_date
+        self._applied_default_source = new_source
+
+        if changed and self._info_box is not None:
+            self._update_info_panel()
+
+    def _apply_defaults_to_boxes(self, boxes) -> None:
+        """Fill empty date/source fields on *boxes* with current defaults."""
+        date   = self._default_date_var.get().strip()
+        source = self._default_source_var.get().strip()
+        for box in boxes:
+            if date   and not box.meta.date:
+                box.meta.date   = date
+            if source and not box.meta.source:
+                box.meta.source = source
+
+    def _on_new_box(self, box) -> None:
+        """Apply current defaults to a freshly created box."""
+        self._apply_defaults_to_boxes([box])
 
     # -- info panel -----------------------------------------------------------
 
@@ -416,6 +475,10 @@ class App:
 
     def _on_done(self, regions) -> None:
         self._canvas.set_boxes(regions)
+        boxes = self._canvas.get_boxes()
+        self._apply_defaults_to_boxes(boxes)
+        self._applied_default_date   = self._default_date_var.get().strip()
+        self._applied_default_source = self._default_source_var.get().strip()
         n = len(regions)
         noun = "region" if n == 1 else "regions"
         self._set_status(
