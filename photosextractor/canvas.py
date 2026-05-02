@@ -586,46 +586,57 @@ class ImageCanvas(tk.Frame):
 
         if self._drag["handle"] == "move":
             rx, ry = event.x_root, event.y_root
+            drag_box = self._drag["box"]
 
-            # OCR fires once on the first motion event so the tooltip is ready early.
-            if "ocr_text" not in self._drag:
-                tmp = PhotoBox(
-                    self._drag["orig_x1"], self._drag["orig_y1"],
-                    self._drag["orig_x2"], self._drag["orig_y2"],
+            # Canvas drop target: a different box whose rect contains the cursor.
+            canvas_target = None
+            for b in reversed(self._boxes):
+                if b is drag_box:
+                    continue
+                bx1, by1, bx2, by2 = b.canvas_rect(self._scale)
+                if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+                    canvas_target = b
+                    break
+
+            # Caption-widget drop target (works off-canvas in phase-2 too).
+            over_caption = False
+            if self._caption_drop_widget is not None:
+                w = self._caption_drop_widget
+                over_caption = (
+                    w.winfo_rootx() <= rx <= w.winfo_rootx() + w.winfo_width()
+                    and w.winfo_rooty() <= ry <= w.winfo_rooty() + w.winfo_height()
                 )
-                self._drag["ocr_text"] = self._ocr_region(tmp)
 
-            ocr_text = self._drag["ocr_text"] or "(no text recognized)"
-            self._tooltip.show_now(ocr_text, rx, ry)
+            if canvas_target is not None or over_caption:
+                # Hovering over a valid drop zone — fire OCR once for the preview.
+                if "ocr_text" not in self._drag:
+                    tmp = PhotoBox(
+                        self._drag["orig_x1"], self._drag["orig_y1"],
+                        self._drag["orig_x2"], self._drag["orig_y2"],
+                    )
+                    self._drag["ocr_text"] = self._ocr_region(tmp)
+                self._tooltip.show_now(
+                    self._drag["ocr_text"] or "(no text recognized)", rx, ry,
+                )
+                self.canvas.config(cursor="hand2")
+            else:
+                self._tooltip.hide()
+                self.canvas.config(cursor=HANDLE_CURSORS["move"])
 
-            in_image = (0 <= cx <= round(self._pil_image.width * self._scale)
+            # Phase-2: cursor crossed the image edge — delete box, tooltip travels on.
+            in_image = (0 <= cx <= round(self._pil_image.width  * self._scale)
                         and 0 <= cy <= round(self._pil_image.height * self._scale))
-
             if not in_image and not self._drag.get("phase2"):
-                # Cursor just crossed the canvas edge — silently delete the box.
                 self._drag["phase2"] = True
-                box = self._drag["box"]
-                self._splits = [s for s in self._splits if s.box is not box]
-                if box in self._boxes:
-                    self._boxes.remove(box)
-                if self.__active is box:
-                    self.__active = None   # bypass property to avoid premature callback
+                self._splits = [s for s in self._splits if s.box is not drag_box]
+                if drag_box in self._boxes:
+                    self._boxes.remove(drag_box)
+                if self.__active is drag_box:
+                    self.__active = None
                 self._redraw()
 
             if self._drag.get("phase2"):
-                # Box is gone; only the tooltip travels with the cursor now.
-                over_caption = False
-                if self._caption_drop_widget is not None:
-                    w = self._caption_drop_widget
-                    over_caption = (
-                        w.winfo_rootx() <= rx <= w.winfo_rootx() + w.winfo_width()
-                        and w.winfo_rooty() <= ry <= w.winfo_rooty() + w.winfo_height()
-                    )
-                self.canvas.config(cursor="hand2" if over_caption else "")
-                return
-
-            # Phase 1: cursor still inside canvas — move box normally.
-            self.canvas.config(cursor=HANDLE_CURSORS["move"])
+                return  # tooltip already managed above; box is gone
         else:
             self._tooltip.hide()
 
@@ -669,6 +680,35 @@ class ImageCanvas(tk.Frame):
         self._drag = None
         self._hide_drag_ghost()
         if drag is not None:
+            if drag["handle"] == "move" and not drag.get("phase2"):
+                # Canvas drop: released on top of a different box.
+                cx_r, cy_r = self._cxy(event)
+                canvas_target = None
+                for b in reversed(self._boxes):
+                    if b is drag["box"]:
+                        continue
+                    bx1, by1, bx2, by2 = b.canvas_rect(self._scale)
+                    if bx1 <= cx_r <= bx2 and by1 <= cy_r <= by2:
+                        canvas_target = b
+                        break
+                if canvas_target is not None:
+                    text = drag.get("ocr_text")
+                    if text is None:
+                        tmp = PhotoBox(
+                            drag["orig_x1"], drag["orig_y1"],
+                            drag["orig_x2"], drag["orig_y2"],
+                        )
+                        text = self._ocr_region(tmp)
+                    canvas_target.meta.caption = text
+                    canvas_target.saved = False
+                    self._tooltip.hide()
+                    self.canvas.config(cursor="")
+                    self._active = canvas_target
+                    if self._on_select_callback is not None:
+                        self._on_select_callback(canvas_target)
+                    self._delete_box(drag["box"])
+                    return
+
             # Caption drop: box released over the Caption widget.
             # Target is the box that was active *before* this drag started
             # (prev_active), so the workflow works even when the user clicked
@@ -788,6 +828,10 @@ class ImageCanvas(tk.Frame):
             menu.add_command(
                 label="Delete Box",
                 command=lambda b=box: self._delete_box(b),
+            )
+            menu.add_command(
+                label="Shrink to Size",
+                command=lambda b=box: self._shrink_to_content(b),
             )
             for adj_box, direction in self._find_adjacent(box):
                 menu.add_command(
@@ -1127,6 +1171,69 @@ class ImageCanvas(tk.Frame):
         self._active = merged
         self._redraw()
         self._notify_change()
+
+    def _apply_shrink(self, box: PhotoBox) -> bool:
+        """Shrink *box* coordinates in-place. Returns True if the box changed.
+        Does not redraw or notify — callers must do that themselves."""
+        if self._pil_image is None:
+            return False
+        try:
+            import numpy as np
+        except ImportError:
+            return False
+
+        x1 = max(0, round(box.x1))
+        y1 = max(0, round(box.y1))
+        x2 = min(self._pil_image.width,  round(box.x2))
+        y2 = min(self._pil_image.height, round(box.y2))
+        if x2 - x1 < 10 or y2 - y1 < 10:
+            return False
+
+        gray = np.array(
+            self._pil_image.crop((x1, y1, x2, y2)).convert("L"),
+            dtype=np.float32,
+        )
+        h, w = gray.shape
+
+        border = np.concatenate([
+            gray[0, :], gray[-1, :],
+            gray[1:-1, 0], gray[1:-1, -1],
+        ])
+        bg = float(np.percentile(border, 90))
+        threshold = bg - 20.0
+
+        mask = gray < threshold
+        rows = np.any(mask, axis=1)
+        cols = np.any(mask, axis=0)
+        if not rows.any() or not cols.any():
+            return False
+
+        r_idx = np.where(rows)[0]
+        c_idx = np.where(cols)[0]
+        top    = int(r_idx[0])
+        bottom = int(r_idx[-1])
+        left   = int(c_idx[0])
+        right  = int(c_idx[-1])
+
+        # 1-pixel safety margin so the photo edge is never clipped
+        box.x1 = float(x1 + max(0,     left   - 1))
+        box.y1 = float(y1 + max(0,     top    - 1))
+        box.x2 = float(x1 + min(w - 1, right  + 1) + 1)
+        box.y2 = float(y1 + min(h - 1, bottom + 1) + 1)
+        return True
+
+    def _shrink_to_content(self, box: PhotoBox) -> None:
+        """RMB command: shrink one box then redraw."""
+        if self._apply_shrink(box):
+            box.saved = False
+        self._redraw()
+        self._notify_change()
+
+    def shrink_all_to_content(self) -> None:
+        """Shrink every box; one redraw at the end. Called after auto-detection."""
+        for box in self._boxes:
+            self._apply_shrink(box)
+        self._redraw()
 
     def _do_split(self, box: PhotoBox, pos: float, orient: str) -> None:
         """

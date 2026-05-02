@@ -797,6 +797,7 @@ class App:
 
     def _on_done(self, regions) -> None:
         self._canvas.set_boxes(regions)
+        self._canvas.shrink_all_to_content()
         boxes = self._canvas.get_boxes()
         self._apply_defaults_to_boxes(boxes)
         self._applied_default_date   = self._default_date_var.get().strip()
