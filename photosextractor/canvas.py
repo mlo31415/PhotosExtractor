@@ -284,6 +284,7 @@ class ImageCanvas(tk.Frame):
         self._caption_drag:  Optional[dict]                    = None   # dragging a caption box
         self._caption_drop_widget: Optional[tk.Widget]         = None   # drop target for designated caption boxes
         self._on_new_box_callback                               = None   # callable(PhotoBox) fired when a box is added
+        self._on_change_callback                                = None   # callable() fired when boxes/metadata change
 
         self._build_widgets()
         self._bind_events()
@@ -354,6 +355,14 @@ class ImageCanvas(tk.Frame):
     def set_on_new_box(self, callback) -> None:
         """Register a callable(PhotoBox) fired whenever a box is manually added."""
         self._on_new_box_callback = callback
+
+    def set_on_change(self, callback) -> None:
+        """Register a callable() fired whenever boxes or their metadata change."""
+        self._on_change_callback = callback
+
+    def _notify_change(self) -> None:
+        if self._on_change_callback is not None:
+            self._on_change_callback()
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -668,7 +677,10 @@ class ImageCanvas(tk.Frame):
         if self._split_drag is not None:
             self._split_drag = None
             return
+        drag = self._drag
         self._drag = None
+        if drag is not None:
+            self._notify_change()
 
     def _on_double_click(self, event: tk.Event) -> None:
         self._drag = None   # cancel any drag-intent from the second press
@@ -802,6 +814,7 @@ class ImageCanvas(tk.Frame):
             self._active = None
         self._splits = [s for s in self._splits if s.box is not box]
         self._redraw()
+        self._notify_change()
 
     def _restore_deleted(self) -> None:
         """Undo the most recent box deletion (one level only)."""
@@ -812,6 +825,7 @@ class ImageCanvas(tk.Frame):
         self._boxes.append(box)
         self._active = box
         self._redraw()
+        self._notify_change()
 
     def _add_box_at(self, cx: float, cy: float) -> None:
         if self._pil_image is None:
@@ -829,6 +843,7 @@ class ImageCanvas(tk.Frame):
             self._on_new_box_callback(box)
         self._active = box
         self._redraw()
+        self._notify_change()
 
     # ── caption-box helpers ───────────────────────────────────────────────────
 
@@ -887,6 +902,7 @@ class ImageCanvas(tk.Frame):
         self._redraw()
         if was_active and self._on_select_callback is not None:
             self._on_select_callback(target)   # force panel refresh if already active
+        self._notify_change()
 
     def _ocr_region(self, cb: CaptionBox) -> str:
         """OCR the image pixels inside cb; return stripped text or error message."""
@@ -1087,6 +1103,7 @@ class ImageCanvas(tk.Frame):
 
         self._active = None
         self._redraw()
+        self._notify_change()
 
 
 # ── module-level helpers ──────────────────────────────────────────────────────

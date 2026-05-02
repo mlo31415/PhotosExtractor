@@ -124,55 +124,38 @@ def _detect_caption(gray: np.ndarray, region: PhotoRegion) -> str:
 
 # ── main detection ────────────────────────────────────────────────────────────
 
-def detect_photos(
-    image_path: str,
+def _detect_from_gray(
+    gray: np.ndarray,
     min_area_fraction: float = 0.005,
     progress: Optional[ProgressFn] = None,
 ) -> List[PhotoRegion]:
-    """
-    Return photo bounding boxes (image pixel coordinates) sorted
-    top-to-bottom then left-to-right.
-
-    If pytesseract + Tesseract are installed, each region's .caption field
-    is pre-filled with OCR'd text found immediately below the photo.
-
-    min_area_fraction: smallest accepted box as a fraction of page area.
-    progress: optional callback(percent: int, message: str).
-    """
-    if not _CV2:
-        raise RuntimeError(
-            "opencv-python is required for detection.\n"
-            "Run:  pip install opencv-python"
-        )
-
+    """Core detection on a pre-loaded grayscale uint8 array."""
     def prog(pct: int, msg: str) -> None:
         if progress:
             progress(pct, msg)
 
-    prog(5, "Loading image…")
-    gray = _load_gray(image_path)
     h, w = gray.shape
     min_area = max(1_000, int(min_area_fraction * h * w))
 
-    prog(18, "Smoothing…")
+    prog(20, "Smoothing…")
     blurred = cv2.GaussianBlur(gray, (7, 7), 2)
 
-    prog(30, "Binarising…")
+    prog(32, "Binarising…")
     _, binary = cv2.threshold(
         blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
     )
 
-    prog(44, "Removing text strokes…")
+    prog(46, "Removing text strokes…")
     stroke_px = max(5, h // 200)
     open_k = np.ones((stroke_px, stroke_px), np.uint8)
     no_text = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_k)
 
-    prog(58, "Filling photo regions…")
+    prog(60, "Filling photo regions…")
     fill_px = stroke_px * 4
     close_k = np.ones((fill_px, fill_px), np.uint8)
     filled = cv2.morphologyEx(no_text, cv2.MORPH_CLOSE, close_k, iterations=2)
 
-    prog(72, "Finding contours…")
+    prog(74, "Finding contours…")
     contours, _ = cv2.findContours(
         filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
@@ -184,20 +167,58 @@ def detect_photos(
             continue
         if cw < 20 or ch < 20:
             continue
-        if max(cw, ch) > 8 * min(cw, ch):   # too elongated
+        if max(cw, ch) > 8 * min(cw, ch):
             continue
-        if cw > 0.92 * w and ch > 0.92 * h:  # full-page blob
+        if cw > 0.92 * w and ch > 0.92 * h:
             continue
         regions.append(PhotoRegion(x, y, x + cw, y + ch))
 
     regions = sorted(regions, key=lambda r: (r.y1, r.x1))
 
     if _TESS and regions:
-        prog(82, "Detecting captions…")
+        prog(84, "Detecting captions…")
         for i, region in enumerate(regions):
             region.caption = _detect_caption(gray, region)
-            pct = 82 + round(13 * (i + 1) / len(regions))
+            pct = 84 + round(12 * (i + 1) / len(regions))
             prog(pct, f"Detecting captions… ({i + 1}/{len(regions)})")
 
     prog(100, "Done")
     return regions
+
+
+def detect_photos(
+    image_path: str,
+    min_area_fraction: float = 0.005,
+    progress: Optional[ProgressFn] = None,
+) -> List[PhotoRegion]:
+    """
+    Return photo bounding boxes for the image at *image_path*, sorted
+    top-to-bottom then left-to-right.
+    """
+    if not _CV2:
+        raise RuntimeError(
+            "opencv-python is required for detection.\n"
+            "Run:  pip install opencv-python"
+        )
+    if progress:
+        progress(5, "Loading image…")
+    gray = _load_gray(image_path)
+    return _detect_from_gray(gray, min_area_fraction, progress)
+
+
+def detect_photos_pil(
+    pil_image: "_PILImage.Image",
+    min_area_fraction: float = 0.005,
+    progress: Optional[ProgressFn] = None,
+) -> List[PhotoRegion]:
+    """
+    Return photo bounding boxes for a pre-loaded PIL image.
+    Used for PDF pages that have no on-disk path.
+    """
+    if not _CV2:
+        raise RuntimeError(
+            "opencv-python is required for detection.\n"
+            "Run:  pip install opencv-python"
+        )
+    gray = np.array(pil_image.convert("L"))
+    return _detect_from_gray(gray, min_area_fraction, progress)

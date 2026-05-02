@@ -14,11 +14,18 @@ from typing import Optional
 from PIL import Image
 
 from .canvas import ImageCanvas
-from .detector import detect_photos
+from .detector import detect_photos, detect_photos_pil
 
 _IMAGE_TYPES = [
     ("Image files", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.gif *.webp *.pgm"),
     ("All files",   "*.*"),
+]
+
+_ALL_FILE_TYPES = [
+    ("Images and PDFs", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.gif *.webp *.pgm *.pdf"),
+    ("Image files",     "*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.gif *.webp *.pgm"),
+    ("PDF files",       "*.pdf"),
+    ("All files",       "*.*"),
 ]
 
 
@@ -92,6 +99,12 @@ class App:
         self._info_box                           = None   # currently displayed PhotoBox
         self._info_panel_loading: bool           = False
 
+        # PDF state
+        self._pdf_doc    = None   # fitz.Document when a PDF is open, else None
+        self._pdf_path:  str  = ""
+        self._pdf_page:  int  = 0   # 0-based current page index
+        self._page_dirty: bool = False
+
         # Track which default values have already been pushed into box metadata
         # so we can propagate edits to boxes that still hold the old default.
         self._applied_default_date:   str           = ""
@@ -152,11 +165,196 @@ class App:
         mid = tk.Frame(self.root)
         mid.pack(fill=tk.BOTH, expand=True)
         self._build_info_panel(mid)
-        self._canvas = ImageCanvas(mid)
-        self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        left_frame = tk.Frame(mid)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Navigation bar (PDF pages) — packed first so pack(before=) works later,
+        # but immediately hidden until a PDF is opened.
+        self._nav_frame = tk.Frame(left_frame, bd=1, relief=tk.FLAT)
+        self._build_nav_bar(self._nav_frame)
+        self._nav_frame.pack(side=tk.TOP, fill=tk.X)
+        self._nav_frame.pack_forget()
+
+        self._canvas = ImageCanvas(left_frame)
+        self._canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self._canvas.set_on_select(self._on_box_selected)
         self._canvas.set_on_new_box(self._on_new_box)
+        self._canvas.set_on_change(self._on_canvas_change)
         self._canvas.set_caption_drop_widget(self._caption_text)
+
+    def _build_nav_bar(self, parent: tk.Widget) -> None:
+        btn = dict(width=3)
+        self._nav_begin = tk.Button(parent, text="|◄", command=self._nav_go_begin, **btn)
+        self._nav_prev  = tk.Button(parent, text="◄",  command=self._nav_go_prev,  **btn)
+        self._nav_next  = tk.Button(parent, text="►",  command=self._nav_go_next,  **btn)
+        self._nav_end   = tk.Button(parent, text="►|", command=self._nav_go_end,   **btn)
+        self._nav_page_var   = tk.StringVar()
+        self._nav_page_entry = tk.Entry(parent, textvariable=self._nav_page_var,
+                                        width=4, justify=tk.CENTER)
+        self._nav_page_entry.bind("<Return>",   self._nav_goto_typed)
+        self._nav_page_entry.bind("<FocusOut>", self._nav_goto_typed)
+        self._nav_total_lbl  = tk.Label(parent, text="of 0")
+
+        for w in (self._nav_begin, self._nav_prev):
+            w.pack(side=tk.LEFT, padx=2, pady=3)
+        tk.Label(parent, text="Page:").pack(side=tk.LEFT, padx=(8, 2), pady=3)
+        self._nav_page_entry.pack(side=tk.LEFT, pady=3)
+        self._nav_total_lbl.pack(side=tk.LEFT, padx=(2, 8), pady=3)
+        for w in (self._nav_next, self._nav_end):
+            w.pack(side=tk.LEFT, padx=2, pady=3)
+
+    # -- PDF support ----------------------------------------------------------
+
+    def _close_pdf(self) -> None:
+        if self._pdf_doc is not None:
+            try:
+                self._pdf_doc.close()
+            except Exception:
+                pass
+            self._pdf_doc = None
+        self._pdf_path  = ""
+        self._pdf_page  = 0
+        self._page_dirty = False
+        self._nav_frame.pack_forget()
+
+    def _load_pdf(self, path: str) -> None:
+        try:
+            import fitz
+        except ImportError:
+            messagebox.showerror(
+                "PyMuPDF Required",
+                "Opening PDF files requires PyMuPDF.\n\nRun:  pip install pymupdf",
+            )
+            return
+        self._close_pdf()
+        try:
+            self._pdf_doc = fitz.open(path)
+        except Exception as exc:
+            messagebox.showerror("Cannot open PDF", str(exc))
+            return
+        self._pdf_path = path
+        self._pdf_page = 0
+        self.root.title(f"PhotosExtractor — {Path(path).name}")
+        self._nav_frame.pack(side=tk.TOP, fill=tk.X, before=self._canvas)
+        self._update_nav_buttons()
+        self._render_pdf_page()
+
+    def _render_pdf_page(self) -> None:
+        if self._pdf_doc is None:
+            return
+        try:
+            import fitz
+            page = self._pdf_doc[self._pdf_page]
+            mat  = fitz.Matrix(150 / 72, 150 / 72)
+            pix  = page.get_pixmap(matrix=mat, alpha=False)
+            pil  = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        except Exception as exc:
+            messagebox.showerror("PDF render failed", str(exc))
+            return
+        n = len(self._pdf_doc)
+        self._pil_image = pil
+        self._canvas.set_image(pil)
+        self.root.title(
+            f"PhotosExtractor — {Path(self._pdf_path).name}  "
+            f"[Page {self._pdf_page + 1} of {n}]"
+        )
+        self._set_status(
+            f"Page {self._pdf_page + 1} of {n} — detecting photos…"
+        )
+        self._run_detection_pil(pil)
+
+    def _run_detection_pil(self, pil_image: Image.Image) -> None:
+        img = pil_image
+        def _worker() -> None:
+            try:
+                regions = detect_photos_pil(
+                    img,
+                    progress=lambda _p, msg: self.root.after(
+                        0, lambda m=msg: self._set_status(m)
+                    ),
+                )
+                self.root.after(0, lambda r=regions: self._on_done(r))
+            except Exception as exc:
+                self.root.after(0, lambda e=str(exc): self._on_error(e))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # -- navigation -----------------------------------------------------------
+
+    def _update_nav_buttons(self) -> None:
+        if self._pdf_doc is None:
+            return
+        n = len(self._pdf_doc)
+        p = self._pdf_page
+        self._nav_begin.config(state=tk.NORMAL if p > 0     else tk.DISABLED)
+        self._nav_prev .config(state=tk.NORMAL if p > 0     else tk.DISABLED)
+        self._nav_next .config(state=tk.NORMAL if p < n - 1 else tk.DISABLED)
+        self._nav_end  .config(state=tk.NORMAL if p < n - 1 else tk.DISABLED)
+        self._nav_page_var.set(str(p + 1))
+        self._nav_total_lbl.config(text=f"of {n}")
+
+    def _nav_check_dirty(self) -> bool:
+        """Return True if safe to navigate (no unsaved changes, or user chose to discard)."""
+        if self._pdf_doc is None or not self._page_dirty:
+            return True
+        return messagebox.askyesno(
+            "Unsaved Changes",
+            "This page has unsaved changes. Discard them and navigate away?",
+            default=messagebox.NO,
+        )
+
+    def _go_to_page(self, page: int) -> None:
+        if self._pdf_doc is None:
+            return
+        page = max(0, min(page, len(self._pdf_doc) - 1))
+        if page == self._pdf_page:
+            return
+        self._pdf_page   = page
+        self._page_dirty = False
+        self._update_nav_buttons()
+        self._render_pdf_page()
+
+    def _nav_go_begin(self) -> None:
+        if self._nav_check_dirty():
+            self._go_to_page(0)
+
+    def _nav_go_prev(self) -> None:
+        if self._nav_check_dirty():
+            self._go_to_page(self._pdf_page - 1)
+
+    def _nav_go_next(self) -> None:
+        if self._nav_check_dirty():
+            self._go_to_page(self._pdf_page + 1)
+
+    def _nav_go_end(self) -> None:
+        if self._nav_check_dirty():
+            self._go_to_page(len(self._pdf_doc) - 1)
+
+    def _nav_goto_typed(self, _event=None) -> None:
+        if self._pdf_doc is None:
+            return
+        try:
+            p = int(self._nav_page_var.get()) - 1
+        except ValueError:
+            self._update_nav_buttons()
+            return
+        p = max(0, min(p, len(self._pdf_doc) - 1))
+        if p == self._pdf_page:
+            self._update_nav_buttons()
+            return
+        if not self._nav_check_dirty():
+            self._update_nav_buttons()
+            return
+        self._go_to_page(p)
+
+    # -- dirty tracking -------------------------------------------------------
+
+    def _mark_page_dirty(self) -> None:
+        if self._pdf_doc is not None:
+            self._page_dirty = True
+
+    def _on_canvas_change(self) -> None:
+        self._mark_page_dirty()
 
     def _build_info_panel(self, parent: tk.Widget) -> None:
         panel = tk.Frame(parent, width=290, bd=1, relief=tk.GROOVE)
@@ -250,7 +448,19 @@ class App:
         _save_settings(s)
 
     def _on_close(self) -> None:
+        if self._pdf_doc is not None and self._page_dirty:
+            if not messagebox.askyesno(
+                "Unsaved Changes",
+                "The current PDF page has unsaved changes. Exit anyway?",
+                default=messagebox.NO,
+            ):
+                return
         self._persist_geometry()
+        if self._pdf_doc is not None:
+            try:
+                self._pdf_doc.close()
+            except Exception:
+                pass
         self.root.destroy()
 
     # -- toolbar --------------------------------------------------------------
@@ -354,6 +564,7 @@ class App:
             return
         self._info_box.meta.caption = self._caption_text.get("1.0", "end-1c")
         self._caption_text.edit_modified(False)
+        self._mark_page_dirty()
 
     def _on_panel_date_changed(self, *_) -> None:
         if self._info_panel_loading:
@@ -361,6 +572,7 @@ class App:
         text = self._panel_date_var.get().strip()
         if self._info_box is not None:
             self._info_box.meta.date = text
+            self._mark_page_dirty()
         if not text:
             self._panel_date_entry.config(bg="white")
         else:
@@ -375,6 +587,7 @@ class App:
         if self._info_panel_loading or self._info_box is None:
             return
         self._info_box.meta.source = self._panel_source_var.get()
+        self._mark_page_dirty()
 
     def _effective_date(self, meta) -> str:
         """Return meta.date if set; else the default date, defaulting time to 23:59:59."""
@@ -404,12 +617,20 @@ class App:
     # -- file / detection actions ---------------------------------------------
 
     def open_image(self) -> None:
-        path = filedialog.askopenfilename(title="Select image", filetypes=_IMAGE_TYPES)
+        path = filedialog.askopenfilename(title="Select image or PDF",
+                                          filetypes=_ALL_FILE_TYPES)
         if not path:
             return
-        self._load_image(path)
+        if not self._nav_check_dirty():
+            return
+        if Path(path).suffix.lower() == ".pdf":
+            self._load_pdf(path)
+        else:
+            self._close_pdf()
+            self._load_image(path)
 
     def _load_image(self, path: str) -> None:
+        self._close_pdf()
         self._image_path = path
         try:
             pil = Image.open(path)
@@ -441,18 +662,28 @@ class App:
         if not m:
             return
         path = (m.group(1) or m.group(2)).strip()
-        if Path(path).suffix.lower() in {
-            ".png", ".jpg", ".jpeg", ".tif", ".tiff",
-            ".bmp", ".gif", ".webp", ".pgm",
-        }:
+        if not self._nav_check_dirty():
+            return
+        ext = Path(path).suffix.lower()
+        if ext == ".pdf":
+            self._load_pdf(path)
+        elif ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff",
+                     ".bmp", ".gif", ".webp", ".pgm"}:
+            self._close_pdf()
             self._load_image(path)
 
     def redetect(self) -> None:
-        if not self._image_path:
-            return
-        self._canvas.clear_boxes()
-        self._set_status("Re-detecting photos…")
-        self._run_detection(self._image_path)
+        if self._pdf_doc is not None:
+            if self._pil_image is None:
+                return
+            self._canvas.clear_boxes()
+            self._page_dirty = False
+            self._set_status(f"Re-detecting photos on page {self._pdf_page + 1}…")
+            self._run_detection_pil(self._pil_image)
+        elif self._image_path:
+            self._canvas.clear_boxes()
+            self._set_status("Re-detecting photos…")
+            self._run_detection(self._image_path)
 
     def clear_boxes(self) -> None:
         self._canvas.clear_boxes()
@@ -479,6 +710,7 @@ class App:
         self._apply_defaults_to_boxes(boxes)
         self._applied_default_date   = self._default_date_var.get().strip()
         self._applied_default_source = self._default_source_var.get().strip()
+        self._page_dirty = False   # freshly detected state is the clean baseline
         n = len(regions)
         noun = "region" if n == 1 else "regions"
         self._set_status(
@@ -539,6 +771,8 @@ class App:
             except Exception as exc:
                 errors.append(f"{dest.name}: {exc}")
 
+        if saved:
+            self._page_dirty = False
         msg = f"Saved {saved} image{'s' if saved != 1 else ''} to:\n{out_dir}"
         if errors:
             msg += "\n\nErrors:\n" + "\n".join(errors)
