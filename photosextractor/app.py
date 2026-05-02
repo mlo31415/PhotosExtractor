@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import threading
@@ -60,11 +61,91 @@ def _save_settings(data: dict) -> None:
 
 def _sanitize(text: str) -> str:
     """Convert arbitrary text to a safe filename stem."""
-    safe = re.sub(r'[\\/:*?"<>|]', "_", text).strip(". ")
+    # Control characters (0x00-0x1F, DEL) plus Windows-illegal chars
+    safe = re.sub(r'[\x00-\x1f\x7f\\/:*?"<>|]', "_", text).strip(". ")
     return safe[:100] or "photo"
 
+
+def _clean_folder_path(raw: str) -> str:
+    """Normalise a folder path that may have been pasted with surrounding quotes."""
+    p = raw.strip()
+    if len(p) >= 2 and p[0] in ('"', "'") and p[-1] == p[0]:
+        p = p[1:-1].strip()
+    return p
+
+
+def _ask_conflict(parent: tk.Tk, filename: str) -> tuple:
+    """Modal dialog shown when an output file already exists.
+    Returns (choice, apply_to_rest) — choice is 'overwrite'|'rename'|'skip'|'cancel'.
+    """
+    dlg = tk.Toplevel(parent)
+    dlg.title("File already exists")
+    dlg.resizable(False, False)
+    dlg.grab_set()
+    dlg.transient(parent)
+
+    tk.Label(dlg, text=f'"{filename}" already exists.', padx=16, pady=12).pack()
+
+    remember_var = tk.BooleanVar(value=False)
+    result = ["cancel"]
+
+    def choose(c: str) -> None:
+        result[0] = c
+        dlg.destroy()
+
+    btn_frame = tk.Frame(dlg)
+    btn_frame.pack(padx=16, pady=(0, 4))
+    for label, key in (("Overwrite", "overwrite"), ("Rename", "rename"),
+                       ("Skip", "skip"), ("Cancel", "cancel")):
+        tk.Button(btn_frame, text=label, width=10,
+                  command=lambda k=key: choose(k)).pack(side=tk.LEFT, padx=4)
+
+    tk.Checkbutton(dlg, text="Do this for any other photos",
+                   variable=remember_var).pack(padx=16, pady=(0, 12))
+
+    dlg.update_idletasks()
+    x = parent.winfo_rootx() + (parent.winfo_width()  - dlg.winfo_width())  // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - dlg.winfo_height()) // 2
+    dlg.geometry(f"+{x}+{y}")
+
+    parent.wait_window(dlg)
+    return result[0], remember_var.get()
+
+
+def _set_file_creation_time_win32(path: str, timestamp: float) -> None:
+    """Set the file creation time on Windows via the SetFileTime API (best-effort)."""
+    try:
+        import ctypes, ctypes.wintypes
+        EPOCH_DIFF       = 116_444_736_000_000_000  # 100-ns ticks: 1601-01-01 → 1970-01-01
+        ticks            = int(timestamp * 10_000_000) + EPOCH_DIFF
+        ft               = ctypes.wintypes.FILETIME(ticks & 0xFFFF_FFFF, ticks >> 32)
+        FILE_WRITE_ATTR  = 0x0100
+        FILE_SHARE_READ  = 0x0001
+        OPEN_EXISTING    = 3
+        FILE_ATTR_NORMAL = 0x0080
+        h = ctypes.windll.kernel32.CreateFileW(
+            path, FILE_WRITE_ATTR, FILE_SHARE_READ,
+            None, OPEN_EXISTING, FILE_ATTR_NORMAL, None,
+        )
+        INVALID = ctypes.cast(ctypes.c_void_p(-1), ctypes.c_void_p).value
+        if h and ctypes.cast(h, ctypes.c_void_p).value != INVALID:
+            ctypes.windll.kernel32.SetFileTime(h, ctypes.byref(ft), None, None)
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        pass
+
+
 def _save_jpg(img: Image.Image, dest: Path, meta) -> None:
-    """Save a cropped PIL image as JPEG with metadata embedded in EXIF."""
+    """Save a cropped PIL image as JPEG with metadata in EXIF and filesystem timestamps."""
+    # Parse the date once — used for both EXIF fields and OS timestamps.
+    dt = None
+    if meta.date:
+        try:
+            from dateutil import parser as _duparser
+            dt = _duparser.parse(meta.date)
+        except Exception:
+            pass
+
     try:
         import piexif
         exif: dict = {"0th": {}, "Exif": {}, "GPS": {}}
@@ -72,11 +153,11 @@ def _save_jpg(img: Image.Image, dest: Path, meta) -> None:
             exif["0th"][piexif.ImageIFD.ImageDescription] = meta.caption.encode("utf-8")
         if meta.source:
             exif["0th"][piexif.ImageIFD.Artist] = meta.source.encode("utf-8")
-        if meta.date:
-            # UserComment (Exif IFD) accepts freeform Unicode via UTF-16-LE
-            exif["Exif"][piexif.ExifIFD.UserComment] = (
-                b"UNICODE\x00" + meta.date.encode("utf-16-le")
-            )
+        if dt is not None:
+            exif_dt = dt.strftime("%Y:%m:%d %H:%M:%S").encode("ascii")
+            exif["0th"][piexif.ImageIFD.DateTime]              = exif_dt
+            exif["Exif"][piexif.ExifIFD.DateTimeOriginal]      = exif_dt
+            exif["Exif"][piexif.ExifIFD.DateTimeDigitized]     = exif_dt
         img.save(str(dest), "JPEG", quality=92, exif=piexif.dump(exif))
     except ImportError:
         # piexif unavailable — fall back to JPEG comment marker
@@ -88,6 +169,16 @@ def _save_jpg(img: Image.Image, dest: Path, meta) -> None:
         comment = "\n".join(p for p in parts if p).encode("utf-8")
         img.save(str(dest), "JPEG", quality=92,
                  comment=comment if comment else None)
+
+    # Stamp the file's modification time (and on Windows, creation time) to match.
+    if dt is not None:
+        try:
+            ts = dt.timestamp()
+            os.utime(dest, (ts, ts))
+            if sys.platform == "win32":
+                _set_file_creation_time_win32(str(dest), ts)
+        except Exception:
+            pass
 
 
 # ── application ───────────────────────────────────────────────────────────────
@@ -123,7 +214,8 @@ class App:
         self._restore_geometry()
 
         self.root.bind("<Control-o>",     lambda _e: self.open_image())
-        self.root.bind("<Control-s>",     lambda _e: self.save_all())
+        self.root.bind("<Control-s>",     lambda _e: self.save_selected())
+        self.root.bind("<Control-h>",     lambda _e: self.show_help())
         self.root.bind("<F5>",            lambda _e: self.redetect())
         self.root.bind("<Control-equal>", lambda _e: self._canvas.zoom(1.25))
         self.root.bind("<Control-minus>", lambda _e: self._canvas.zoom(0.8))
@@ -144,7 +236,8 @@ class App:
         fm = tk.Menu(bar, tearoff=0)
         fm.add_command(label="Open Image…",      accelerator="Ctrl+O", command=self.open_image)
         fm.add_separator()
-        fm.add_command(label="Save All Photos…", accelerator="Ctrl+S", command=self.save_all)
+        fm.add_command(label="Save Selected Photo", accelerator="Ctrl+S", command=self.save_selected)
+        fm.add_command(label="Save All Photos…",                        command=self.save_all)
         fm.add_separator()
         fm.add_command(label="Exit", command=self._on_close)
         bar.add_cascade(label="File", menu=fm)
@@ -159,6 +252,10 @@ class App:
         vm.add_command(label="Zoom Out",      accelerator="Ctrl+-", command=lambda: self._canvas.zoom(0.8))
         vm.add_command(label="Fit to Window", accelerator="Ctrl+0", command=self._canvas._fit if False else lambda: self._canvas._fit())
         bar.add_cascade(label="View", menu=vm)
+
+        hm = tk.Menu(bar, tearoff=0)
+        hm.add_command(label="Keyboard Shortcuts…", accelerator="Ctrl+H", command=self.show_help)
+        bar.add_cascade(label="Help", menu=hm)
 
         self.root.config(menu=bar)
 
@@ -704,6 +801,77 @@ class App:
         win.wm_geometry(f"+{rx}+{ry}")
         win.after(ms, win.destroy)
 
+    # -- help -----------------------------------------------------------------
+
+    def show_help(self) -> None:
+        """Display a non-modal keyboard-shortcuts reference window."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Keyboard Shortcuts")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+
+        sections = [
+            ("File", [
+                ("Ctrl+O",         "Open image or PDF"),
+                ("Ctrl+S",         "Save selected photo  (saves all if none selected)"),
+                ("← / →",          "Previous / next page  (PDF)"),
+                ("Home / End",     "First / last page  (PDF)"),
+            ]),
+            ("Zoom", [
+                ("Ctrl+Scroll",    "Zoom in / out"),
+                ("Ctrl++",         "Zoom in"),
+                ("Ctrl+-",         "Zoom out"),
+                ("Ctrl+0",         "Fit image to window"),
+            ]),
+            ("Boxes", [
+                ("Drag edge/corner",  "Resize box"),
+                ("Drag body",         "Move box"),
+                ("Delete",            "Delete selected box"),
+                ("Shift+drag",        "Draw split line across box"),
+                ("Double-click",      "Edit box metadata"),
+            ]),
+            ("Right-click menu", [
+                ("Add Box Here",      "Create a new box at the cursor"),
+                ("Split",             "Split box along the split line"),
+                ("Delete Box",        "Delete the box"),
+                ("Undo Delete Box",   "Restore last deleted box (ghost region)"),
+                ("Shrink to Size",    "Shrink box to fit the photo content"),
+            ]),
+            ("OCR drag", [
+                ("Rubber-band drag",  "Draw a selection; OCR fires when hovering a target"),
+                ("Drop on caption",   "Deposit OCR text into the Caption field"),
+                ("Drop on photo box", "Deposit OCR text into that box's Caption"),
+            ]),
+            ("Other", [
+                ("F5",               "Re-detect photos on current image"),
+                ("Ctrl+H",           "This help window"),
+            ]),
+        ]
+
+        pad_x, pad_y = 20, 1
+        row = 0
+        for section, items in sections:
+            tk.Label(dlg, text=section, font=("TkDefaultFont", 9, "bold"),
+                     anchor="w").grid(row=row, column=0, columnspan=2,
+                                      padx=pad_x, pady=(5 if row else 6, 1), sticky="w")
+            row += 1
+            for key, desc in items:
+                tk.Label(dlg, text=key,  anchor="w", width=22,
+                         font=("TkFixedFont", 9)).grid(row=row, column=0,
+                                                        padx=(pad_x + 8, 4), pady=pad_y, sticky="w")
+                tk.Label(dlg, text=desc, anchor="w",
+                         font=("TkDefaultFont", 9)).grid(row=row, column=1,
+                                                          padx=(4, pad_x), pady=pad_y, sticky="w")
+                row += 1
+
+        tk.Button(dlg, text="Close", width=10,
+                  command=dlg.destroy).grid(row=row, column=0, columnspan=2, pady=(5, 8))
+
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width()  - dlg.winfo_width())  // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
+
     # -- file / detection actions ---------------------------------------------
 
     def open_image(self) -> None:
@@ -816,7 +984,7 @@ class App:
         messagebox.showerror("Detection failed", msg)
         self._set_status("Detection failed — see error dialog.")
 
-    # -- Save All -------------------------------------------------------------
+    # -- Save -----------------------------------------------------------------
 
     def save_all(self) -> None:
         if self._pil_image is None:
@@ -826,19 +994,53 @@ class App:
         if not boxes:
             messagebox.showinfo("Save All", "There are no photo boxes to save.")
             return
+        self._do_save(boxes)
 
-        out_dir = self._output_folder_var.get().strip()
+    def save_selected(self) -> None:
+        if self._pil_image is None:
+            messagebox.showinfo("Save", "No image is open.")
+            return
+        if self._info_box is None:
+            self.save_all()
+            return
+        self._do_save([self._info_box])
+
+    def _do_save(self, boxes: list) -> None:
+        out_dir = _clean_folder_path(self._output_folder_var.get())
         if not out_dir:
             out_dir = filedialog.askdirectory(title="Select output folder")
             if not out_dir:
                 return
             self._output_folder_var.set(out_dir)
+        else:
+            self._output_folder_var.set(out_dir)
 
         out_path = Path(out_dir)
+        if not out_path.exists():
+            if not messagebox.askyesno(
+                "Create folder?",
+                f"Output folder does not exist:\n{out_path}\n\nCreate it?",
+            ):
+                return
+            try:
+                out_path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror(
+                    "Output folder error",
+                    f"Could not create output folder:\n{out_path}\n\n{exc}",
+                )
+                return
+        elif not out_path.is_dir():
+            messagebox.showerror(
+                "Output folder error",
+                f"The output path is not a folder:\n{out_path}",
+            )
+            return
+
         saved, errors = 0, []
+        auto_choice = None  # remembered answer when "Do this for any other photos" is checked
 
         for i, box in enumerate(boxes, 1):
-            # Crop from the full-resolution original image
             region = (
                 max(0, round(box.x1)),
                 max(0, round(box.y1)),
@@ -850,10 +1052,23 @@ class App:
             first_line = box.meta.caption.split("\n")[0] if box.meta.caption else ""
             stem = _sanitize(first_line) if first_line else f"photo_{i:03d}"
             dest = out_path / f"{stem}.jpg"
-            n = 1
-            while dest.exists():
-                dest = out_path / f"{stem}_{n}.jpg"
-                n += 1
+
+            if dest.exists():
+                choice = auto_choice
+                if choice is None:
+                    choice, remember = _ask_conflict(self.root, dest.name)
+                    if remember:
+                        auto_choice = choice
+                if choice == "cancel":
+                    break
+                elif choice == "skip":
+                    continue
+                elif choice == "rename":
+                    n = 1
+                    while dest.exists():
+                        dest = out_path / f"{stem}_{n}.jpg"
+                        n += 1
+                # "overwrite": dest stays as-is
 
             eff = types.SimpleNamespace(
                 caption=box.meta.caption,
@@ -869,7 +1084,7 @@ class App:
 
         if saved:
             self._page_dirty = False
-            self._persist_geometry()   # write output folder, default date & source immediately
+            self._persist_geometry()
         if errors:
             messagebox.showerror(
                 "Save — Errors",
