@@ -195,6 +195,10 @@ class App:
         self._nav_page_entry.bind("<Return>",   self._nav_goto_typed)
         self._nav_page_entry.bind("<FocusOut>", self._nav_goto_typed)
         self._nav_total_lbl  = tk.Label(parent, text="of 0")
+        self._nav_goto_var   = tk.StringVar()
+        self._nav_goto_entry = tk.Entry(parent, textvariable=self._nav_goto_var,
+                                        width=4, justify=tk.CENTER)
+        self._nav_goto_entry.bind("<Return>", self._nav_do_goto)
 
         for w in (self._nav_begin, self._nav_prev):
             w.pack(side=tk.LEFT, padx=2, pady=3)
@@ -203,6 +207,8 @@ class App:
         self._nav_total_lbl.pack(side=tk.LEFT, padx=(2, 8), pady=3)
         for w in (self._nav_next, self._nav_end):
             w.pack(side=tk.LEFT, padx=2, pady=3)
+        tk.Label(parent, text="Goto:").pack(side=tk.LEFT, padx=(16, 2), pady=3)
+        self._nav_goto_entry.pack(side=tk.LEFT, pady=3)
 
     # -- PDF support ----------------------------------------------------------
 
@@ -344,6 +350,22 @@ class App:
             return
         if not self._nav_check_dirty():
             self._update_nav_buttons()
+            return
+        self._go_to_page(p)
+
+    def _nav_do_goto(self, _event=None) -> None:
+        if self._pdf_doc is None:
+            return
+        try:
+            p = int(self._nav_goto_var.get()) - 1
+        except ValueError:
+            self._nav_goto_var.set("")
+            return
+        self._nav_goto_var.set("")
+        p = max(0, min(p, len(self._pdf_doc) - 1))
+        if p == self._pdf_page:
+            return
+        if not self._nav_check_dirty():
             return
         self._go_to_page(p)
 
@@ -646,8 +668,9 @@ class App:
     def _setup_dnd(self) -> None:
         try:
             from tkinterdnd2 import DND_FILES
-            # Register every major widget — on Windows each is a separate HWND
-            for w in (self.root, self._canvas, self._canvas.canvas):
+            # Register every major widget — on Windows each is a separate HWND.
+            # _nav_frame is included so drops onto the PDF nav bar also work.
+            for w in (self.root, self._canvas, self._canvas.canvas, self._nav_frame):
                 try:
                     w.drop_target_register(DND_FILES)
                     w.dnd_bind("<<Drop>>", self._on_drop)
