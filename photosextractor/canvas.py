@@ -147,6 +147,7 @@ class PhotoBox:
         self.x2   = float(max(x1, x2))
         self.y2   = float(max(y1, y2))
         self.meta = meta if meta is not None else PhotoMeta()
+        self.saved: bool = False   # True after the box has been written to disk
 
     @property
     def width(self) -> float:

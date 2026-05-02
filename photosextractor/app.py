@@ -164,6 +164,8 @@ class App:
         self._default_date_var.trace_add("write", self._on_date_changed)
         self._default_source_var = tk.StringVar()
         self._default_source_var.trace_add("write", self._on_source_changed)
+        self._output_folder_var = tk.StringVar()
+        self._output_folder_var.trace_add("write", lambda *_: self._schedule_save())
 
     def _build_canvas(self) -> None:
         mid = tk.Frame(self.root)
@@ -172,6 +174,10 @@ class App:
 
         left_frame = tk.Frame(mid)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._output_bar = tk.Frame(left_frame)
+        self._build_output_bar(self._output_bar)
+        self._output_bar.pack(side=tk.TOP, fill=tk.X)
 
         # Navigation bar (PDF pages) — packed first so pack(before=) works later,
         # but immediately hidden until a PDF is opened.
@@ -186,6 +192,23 @@ class App:
         self._canvas.set_on_new_box(self._on_new_box)
         self._canvas.set_on_change(self._on_canvas_change)
         self._canvas.set_caption_drop_widget(self._caption_text)
+
+    def _build_output_bar(self, parent: tk.Widget) -> None:
+        tk.Button(
+            parent, text="Output Folder:", command=self._choose_output_folder,
+        ).pack(side=tk.LEFT, padx=(6, 4), pady=4)
+        tk.Entry(parent, textvariable=self._output_folder_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6), pady=4,
+        )
+
+    def _choose_output_folder(self) -> None:
+        current = self._output_folder_var.get().strip()
+        folder = filedialog.askdirectory(
+            title="Select output folder",
+            initialdir=current if current else None,
+        )
+        if folder:
+            self._output_folder_var.set(folder)
 
     def _build_nav_bar(self, parent: tk.Widget) -> None:
         btn = dict(width=3)
@@ -307,11 +330,17 @@ class App:
         """Return True if safe to navigate (no unsaved changes, or user chose to discard)."""
         if self._pdf_doc is None or not self._page_dirty:
             return True
+        if self._all_boxes_saved():
+            return True
         return messagebox.askyesno(
             "Unsaved Changes",
             "This page has unsaved changes. Discard them and navigate away?",
             default=messagebox.NO,
         )
+
+    def _all_boxes_saved(self) -> bool:
+        boxes = self._canvas.get_boxes()
+        return bool(boxes) and all(b.saved for b in boxes)
 
     def _go_to_page(self, page: int) -> None:
         if self._pdf_doc is None:
@@ -464,6 +493,7 @@ class App:
             self.root.geometry("1100x800")
         self._default_date_var.set(s.get("default_date", ""))
         self._default_source_var.set(s.get("default_source", ""))
+        self._output_folder_var.set(s.get("output_folder", ""))
 
     def _on_configure(self, event: tk.Event) -> None:
         if event.widget is not self.root:
@@ -480,10 +510,11 @@ class App:
         s["geometry"]       = self.root.geometry()
         s["default_date"]   = self._default_date_var.get()
         s["default_source"] = self._default_source_var.get()
+        s["output_folder"]  = self._output_folder_var.get()
         _save_settings(s)
 
     def _on_close(self) -> None:
-        if self._pdf_doc is not None and self._page_dirty:
+        if self._pdf_doc is not None and self._page_dirty and not self._all_boxes_saved():
             if not messagebox.askyesno(
                 "Unsaved Changes",
                 "The current PDF page has unsaved changes. Exit anyway?",
@@ -649,6 +680,25 @@ class App:
         self._status.set(msg)
         self.root.update_idletasks()
 
+    def _show_brief_message(self, text: str, ms: int = 1800) -> None:
+        """Display a small borderless popup that self-destructs after *ms* milliseconds."""
+        win = tk.Toplevel(self.root)
+        win.wm_overrideredirect(True)
+        win.wm_attributes("-topmost", True)
+        tk.Label(
+            win, text=text,
+            font=("TkDefaultFont", 11),
+            bg="#e8f5e9", fg="#1b5e20",
+            relief="solid", borderwidth=1,
+            padx=20, pady=12,
+        ).pack()
+        win.update_idletasks()
+        # Centre over the main window
+        rx = self.root.winfo_rootx() + (self.root.winfo_width()  - win.winfo_width())  // 2
+        ry = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 2
+        win.wm_geometry(f"+{rx}+{ry}")
+        win.after(ms, win.destroy)
+
     # -- file / detection actions ---------------------------------------------
 
     def open_image(self) -> None:
@@ -771,9 +821,12 @@ class App:
             messagebox.showinfo("Save All", "There are no photo boxes to save.")
             return
 
-        out_dir = filedialog.askdirectory(title="Select output folder")
+        out_dir = self._output_folder_var.get().strip()
         if not out_dir:
-            return
+            out_dir = filedialog.askdirectory(title="Select output folder")
+            if not out_dir:
+                return
+            self._output_folder_var.set(out_dir)
 
         out_path = Path(out_dir)
         saved, errors = 0, []
@@ -803,14 +856,19 @@ class App:
             )
             try:
                 _save_jpg(crop, dest, eff)
+                box.saved = True
                 saved += 1
             except Exception as exc:
                 errors.append(f"{dest.name}: {exc}")
 
         if saved:
             self._page_dirty = False
-        msg = f"Saved {saved} image{'s' if saved != 1 else ''} to:\n{out_dir}"
         if errors:
-            msg += "\n\nErrors:\n" + "\n".join(errors)
-        messagebox.showinfo("Save All", msg)
+            messagebox.showerror(
+                "Save — Errors",
+                f"Saved {saved} photo(s); {len(errors)} error(s):\n\n"
+                + "\n".join(errors),
+            )
+        elif saved:
+            self._show_brief_message(f"{saved} photo{'s' if saved != 1 else ''} saved")
         self._set_status(f"Saved {saved} photo(s) to {out_dir}")
