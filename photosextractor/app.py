@@ -123,6 +123,10 @@ class App:
         self.root.bind("<Control-equal>", lambda _e: self._canvas.zoom(1.25))
         self.root.bind("<Control-minus>", lambda _e: self._canvas.zoom(0.8))
         self.root.bind("<Control-0>",     lambda _e: self._canvas._fit())
+        self.root.bind("<Right>",         lambda _e: self._nav_key("next"))
+        self.root.bind("<Left>",          lambda _e: self._nav_key("prev"))
+        self.root.bind("<Home>",          lambda _e: self._nav_key("begin"))
+        self.root.bind("<End>",           lambda _e: self._nav_key("end"))
         self.root.bind("<Configure>",     self._on_configure)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._setup_dnd()
@@ -368,6 +372,15 @@ class App:
         if not self._nav_check_dirty():
             return
         self._go_to_page(p)
+
+    def _nav_key(self, direction: str) -> None:
+        """Keyboard handler for PDF page navigation (suppressed in text widgets)."""
+        if self._pdf_doc is None:
+            return
+        if isinstance(self.root.focus_get(), (tk.Entry, tk.Text)):
+            return
+        {"next": self._nav_go_next, "prev": self._nav_go_prev,
+         "begin": self._nav_go_begin, "end": self._nav_go_end}[direction]()
 
     # -- dirty tracking -------------------------------------------------------
 

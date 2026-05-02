@@ -7,8 +7,17 @@ Click box            → select (amber highlight)
 Delete key           → remove selected box
 Double-click box     → edit metadata (Caption / Date / Source)
 Hover over box       → tooltip after 700 ms
-Right-click box      → Delete Box / Edit Metadata…
+Right-click box      → Delete Box / Merge with Adjacent Box
 Right-click canvas   → Add Box Here
+
+Rubber-band / OCR workflow
+──────────────────────────
+Drag on empty canvas → draw a new photo box (green border, no handles until clicked).
+  • Leave it alone   → it becomes a permanent photo box.
+  • Click it and drag it to the Caption field in the info panel →
+      OCR fires when the cursor enters the field; a tooltip shows the recognised
+      text.  Releasing over the field pastes the text into the active photo's
+      Caption and deletes the dragged box.
 
 Split-line workflow
 ───────────────────
@@ -55,10 +64,7 @@ MIN_BOX_PX    = 10
 SPLIT_COLOR  = "#1E90FF"   # dodger-blue
 SPLIT_WIDTH  = 2
 
-# Caption-box visuals
-CAPTION_COLOR      = "#1E90FF"   # dashed blue selection box
-CAPTION_WIDTH      = 2
-MIN_RUBBER_BAND_PX = 20          # minimum canvas pixels each axis to keep a drawn selection
+MIN_RUBBER_BAND_PX = 20   # minimum canvas pixels each axis to commit a rubber-band box
 
 _SHIFT = 0x0001   # Shift modifier bit in event.state
 
@@ -215,25 +221,6 @@ class SplitLine:
         self.pos    = pos       # split coordinate in image pixels
 
 
-class CaptionBox:
-    """
-    A user-drawn text-selection region outside all photo boxes.
-    Drag it onto the Caption field in the Photo Information panel to OCR
-    that image region and fill the active photo's caption.
-    """
-    def __init__(self, x1: float, y1: float, x2: float, y2: float) -> None:
-        self.x1 = float(min(x1, x2))
-        self.y1 = float(min(y1, y2))
-        self.x2 = float(max(x1, x2))
-        self.y2 = float(max(y1, y2))
-
-    def canvas_rect(self, scale: float) -> Tuple[int, int, int, int]:
-        return (
-            round(self.x1 * scale), round(self.y1 * scale),
-            round(self.x2 * scale), round(self.y2 * scale),
-        )
-
-
 _tesseract_warned = False   # show the install dialog at most once per session
 
 
@@ -278,13 +265,11 @@ class ImageCanvas(tk.Frame):
         self._split_pts:    Optional[List[Tuple[float, float]]] = None
         self._split_drag:   Optional[dict]                      = None
         self._last_deleted: Optional[PhotoBox]                  = None
-        # Caption-box state
-        self._caption_boxes: List[CaptionBox]                  = []
-        self._rubber_band:   Optional[dict]                    = None   # live during LMB drag on empty canvas
-        self._caption_drag:  Optional[dict]                    = None   # dragging a caption box
-        self._caption_drop_widget: Optional[tk.Widget]         = None   # drop target for designated caption boxes
+        self._rubber_band:  Optional[dict]                     = None   # live during LMB drag on empty canvas
+        self._caption_drop_widget: Optional[tk.Widget]         = None   # Caption text widget for OCR drops
         self._on_new_box_callback                               = None   # callable(PhotoBox) fired when a box is added
         self._on_change_callback                                = None   # callable() fired when boxes/metadata change
+        self._drag_ghost: Optional[tk.Toplevel]                 = None   # borderless window that follows cursor off-canvas
 
         self._build_widgets()
         self._bind_events()
@@ -309,26 +294,11 @@ class ImageCanvas(tk.Frame):
         c.bind("<ButtonRelease-1>",      self._on_release)
         c.bind("<Double-ButtonPress-1>", self._on_double_click)
         c.bind("<Motion>",               self._on_hover)
-        c.bind("<Leave>",                lambda _e: self._tooltip.hide())
+        c.bind("<Leave>",                self._on_canvas_leave)
         c.bind("<ButtonPress-3>",        self._on_right_click)
         c.bind("<Delete>",               self._on_delete_key)
         c.bind("<Control-MouseWheel>",   self._on_ctrl_scroll)
         self._tooltip = _Tooltip(c)
-        # Safety-net: catch releases that land on other widgets (e.g. info panel)
-        self.after(0, self._bind_root_release)
-
-    def _bind_root_release(self) -> None:
-        root = self.winfo_toplevel()
-        root.bind("<ButtonRelease-1>", self._on_root_release, add=True)
-
-    def _on_root_release(self, event: tk.Event) -> None:
-        """Safety-net: clean up caption drag if the canvas missed the release."""
-        if self._caption_drag is not None:
-            cb       = self._caption_drag["cb"]
-            ocr_text = self._caption_drag.get("ocr_text")
-            self._caption_drag = None
-            self._tooltip.hide()
-            self._try_drop_caption(cb, event.x_root, event.y_root, ocr_text)
 
     # ── selection property (fires callback on change) ────────────────────────
 
@@ -370,9 +340,7 @@ class ImageCanvas(tk.Frame):
         self._pil_image = pil_image
         self._boxes.clear()
         self._splits.clear()
-        self._caption_boxes.clear()
         self._rubber_band = None
-        self._caption_drag = None
         self._active = None
         self._last_deleted = None
         self.update_idletasks()
@@ -431,15 +399,12 @@ class ImageCanvas(tk.Frame):
     # ── drawing ───────────────────────────────────────────────────────────────
 
     def _redraw(self) -> None:
-        """Redraw all boxes, caption boxes, split lines, and rubber band."""
+        """Redraw all boxes, split lines, and rubber band."""
         self.canvas.delete("box")
         self.canvas.delete("split")
-        self.canvas.delete("caption")
         self.canvas.delete("rubber_band")
         for idx, box in enumerate(self._boxes):
             self._draw_box(box, idx, active=(box is self._active))
-        for idx, cb in enumerate(self._caption_boxes):
-            self._draw_caption_box(cb, idx)
         for idx, split in enumerate(self._splits):
             self._draw_split_line(split, idx)
         if self._rubber_band is not None:
@@ -497,14 +462,6 @@ class ImageCanvas(tk.Frame):
             tags="split_preview",
         )
 
-    def _draw_caption_box(self, cb: CaptionBox, idx: int) -> None:
-        tag = ("caption", f"cap{idx}")
-        cx1, cy1, cx2, cy2 = cb.canvas_rect(self._scale)
-        self.canvas.create_rectangle(
-            cx1, cy1, cx2, cy2,
-            outline=CAPTION_COLOR, dash=(4, 4), width=CAPTION_WIDTH, tags=tag,
-        )
-
     def _draw_rubber_band(self) -> None:
         self.canvas.delete("rubber_band")
         rb = self._rubber_band
@@ -512,7 +469,7 @@ class ImageCanvas(tk.Frame):
             return
         self.canvas.create_rectangle(
             rb["cx0"], rb["cy0"], rb["cx1"], rb["cy1"],
-            outline=CAPTION_COLOR, dash=(4, 4), width=1,
+            outline=SPLIT_COLOR, dash=(4, 4), width=1,
             tags="rubber_band",
         )
 
@@ -551,14 +508,6 @@ class ImageCanvas(tk.Frame):
                 return box, "move"
         return None, None
 
-    def _hit_caption_box(self, cx: float, cy: float) -> Optional[CaptionBox]:
-        s = self._scale
-        for cb in reversed(self._caption_boxes):
-            bx1, by1, bx2, by2 = cb.canvas_rect(s)
-            if bx1 <= cx <= bx2 and by1 <= cy <= by2:
-                return cb
-        return None
-
     # ── mouse events ──────────────────────────────────────────────────────────
 
     def _on_press(self, event: tk.Event) -> None:
@@ -579,25 +528,25 @@ class ImageCanvas(tk.Frame):
             self._split_drag = {"split": split, "last_cx": cx, "last_cy": cy}
             return
 
-        # LMB on a caption box → start drag (box stays put; drop on Caption field to OCR)
-        cb = self._hit_caption_box(cx, cy)
-        if cb is not None:
-            self._caption_drag = {"cb": cb}
-            return
-
         box, handle = self._hit_box(cx, cy)
         if box is not None:
-            # Clicked a photo box — select it
-            changed = box is not self._active
+            # Record the box that was active *before* this click — it becomes
+            # the caption deposit target when the drag ends on the Caption field.
+            prev = self._active
+            changed = box is not prev
             self._active = box
-            self._drag = {"box": box, "handle": handle,
-                          "last_cx": cx, "last_cy": cy}
+            self._drag = {
+                "box": box, "handle": handle,
+                "last_cx": cx, "last_cy": cy,
+                "orig_x1": box.x1, "orig_y1": box.y1,
+                "orig_x2": box.x2, "orig_y2": box.y2,
+                "prev_active": prev,   # None if nothing was selected before
+            }
             if changed:
                 self._redraw()
         else:
-            # Empty space: start rubber-band WITHOUT clearing the active photo box.
-            # The user may be drawing a text selection to drop on the Caption field,
-            # and we need _active to know which photo receives the OCR result.
+            # Empty space: start rubber-band WITHOUT changing the active photo box
+            # so that the previous selection remains the caption deposit target.
             self._drag = None
             self._rubber_band = {"cx0": cx, "cy0": cy, "cx1": cx, "cy1": cy}
 
@@ -606,12 +555,6 @@ class ImageCanvas(tk.Frame):
             cx, cy = self._cxy(event)
             self._split_pts.append((cx, cy))
             self._draw_split_preview()
-            return
-        if self._caption_drag is not None:
-            # OCR exactly once, on first motion
-            if "ocr_text" not in self._caption_drag:
-                self._caption_drag["ocr_text"] = self._ocr_region(self._caption_drag["cb"])
-            self._show_caption_tooltip(event.x_root, event.y_root)
             return
         if self._rubber_band is not None:
             cx, cy = self._cxy(event)
@@ -638,8 +581,53 @@ class ImageCanvas(tk.Frame):
             return
         if not self._drag or self._pil_image is None:
             return
-        self._tooltip.hide()
         cx, cy = self._cxy(event)
+
+        if self._drag["handle"] == "move":
+            rx, ry = event.x_root, event.y_root
+
+            # OCR fires once on the first motion event so the tooltip is ready early.
+            if "ocr_text" not in self._drag:
+                tmp = PhotoBox(
+                    self._drag["orig_x1"], self._drag["orig_y1"],
+                    self._drag["orig_x2"], self._drag["orig_y2"],
+                )
+                self._drag["ocr_text"] = self._ocr_region(tmp)
+
+            ocr_text = self._drag["ocr_text"] or "(no text recognized)"
+            self._tooltip.show_now(ocr_text, rx, ry)
+
+            in_image = (0 <= cx <= round(self._pil_image.width * self._scale)
+                        and 0 <= cy <= round(self._pil_image.height * self._scale))
+
+            if not in_image and not self._drag.get("phase2"):
+                # Cursor just crossed the canvas edge — silently delete the box.
+                self._drag["phase2"] = True
+                box = self._drag["box"]
+                self._splits = [s for s in self._splits if s.box is not box]
+                if box in self._boxes:
+                    self._boxes.remove(box)
+                if self.__active is box:
+                    self.__active = None   # bypass property to avoid premature callback
+                self._redraw()
+
+            if self._drag.get("phase2"):
+                # Box is gone; only the tooltip travels with the cursor now.
+                over_caption = False
+                if self._caption_drop_widget is not None:
+                    w = self._caption_drop_widget
+                    over_caption = (
+                        w.winfo_rootx() <= rx <= w.winfo_rootx() + w.winfo_width()
+                        and w.winfo_rooty() <= ry <= w.winfo_rooty() + w.winfo_height()
+                    )
+                self.canvas.config(cursor="hand2" if over_caption else "")
+                return
+
+            # Phase 1: cursor still inside canvas — move box normally.
+            self.canvas.config(cursor=HANDLE_CURSORS["move"])
+        else:
+            self._tooltip.hide()
+
         dx = (cx - self._drag["last_cx"]) / self._scale
         dy = (cy - self._drag["last_cy"]) / self._scale
         iw, ih = self._pil_image.size
@@ -654,13 +642,6 @@ class ImageCanvas(tk.Frame):
             self._split_pts.append((cx, cy))
             self._finish_split()
             return
-        if self._caption_drag is not None:
-            cb       = self._caption_drag["cb"]
-            ocr_text = self._caption_drag.get("ocr_text")
-            self._caption_drag = None
-            self._tooltip.hide()
-            self._try_drop_caption(cb, event.x_root, event.y_root, ocr_text)
-            return
         if self._rubber_band is not None:
             rb = self._rubber_band
             self._rubber_band = None
@@ -668,10 +649,16 @@ class ImageCanvas(tk.Frame):
             if (abs(rb["cx1"] - rb["cx0"]) >= MIN_RUBBER_BAND_PX and
                     abs(rb["cy1"] - rb["cy0"]) >= MIN_RUBBER_BAND_PX):
                 s = self._scale
-                self._caption_boxes.append(CaptionBox(
+                box = PhotoBox(
                     rb["cx0"] / s, rb["cy0"] / s,
                     rb["cx1"] / s, rb["cy1"] / s,
-                ))
+                )
+                self._last_deleted = None
+                self._boxes.append(box)
+                if self._on_new_box_callback is not None:
+                    self._on_new_box_callback(box)
+                # Do NOT change _active: keep the previously selected box so it
+                # remains the caption deposit target for an immediate OCR drag.
                 self._redraw()
             return
         if self._split_drag is not None:
@@ -679,14 +666,60 @@ class ImageCanvas(tk.Frame):
             return
         drag = self._drag
         self._drag = None
+        self._hide_drag_ghost()
         if drag is not None:
+            # Caption drop: box released over the Caption widget.
+            # Target is the box that was active *before* this drag started
+            # (prev_active), so the workflow works even when the user clicked
+            # the OCR box itself (making it the current active box).
+            if drag["handle"] == "move" and self._caption_drop_widget is not None:
+                w = self._caption_drop_widget
+                if (w.winfo_rootx() <= event.x_root <= w.winfo_rootx() + w.winfo_width()
+                        and w.winfo_rooty() <= event.y_root <= w.winfo_rooty() + w.winfo_height()):
+                    target = drag.get("prev_active")
+                    if target is drag["box"]:
+                        target = None
+                    # If nothing was pre-selected, use the nearest other box
+                    if target is None:
+                        target = self._nearest_other_box(drag["box"])
+                    text = drag.get("ocr_text")
+                    if text is None:
+                        tmp = PhotoBox(
+                            drag["orig_x1"], drag["orig_y1"],
+                            drag["orig_x2"], drag["orig_y2"],
+                        )
+                        text = self._ocr_region(tmp)
+                    if target is not None:
+                        target.meta.caption = text
+                    self._tooltip.hide()
+                    self.canvas.config(cursor="")
+                    # Switch active to target and refresh the panel
+                    self._active = target
+                    if self._on_select_callback is not None:
+                        self._on_select_callback(target)
+                    self._delete_box(drag["box"])   # also calls _notify_change
+                    return
+            self._tooltip.hide()
+            self.canvas.config(cursor="")
             self._notify_change()
+
+    def _on_canvas_leave(self, event: tk.Event) -> None:
+        # During an OCR-drag the tooltip travels with the cursor off-canvas; keep it.
+        if self._drag is not None and self._drag.get("handle") == "move":
+            return
+        self._tooltip.hide()
 
     def _on_double_click(self, event: tk.Event) -> None:
         self._drag = None   # cancel any drag-intent from the second press
 
     def _on_hover(self, event: tk.Event) -> None:
-        if self._drag or self._split_pts is not None:
+        if self._drag:
+            # _on_drag owns the tooltip and cursor during a box drag; don't
+            # interfere.  (tkinter fires both <Motion> and <B1-Motion> on the
+            # same move event, so _on_hover would otherwise wipe any tooltip
+            # that _on_drag just displayed.)
+            return
+        if self._split_pts is not None:
             self._tooltip.hide()
             return
         if self._split_drag is not None:
@@ -695,10 +728,6 @@ class ImageCanvas(tk.Frame):
             self.canvas.config(cursor=cur)
             self._tooltip.hide()
             return
-        if self._caption_drag is not None:
-            self.canvas.config(cursor="fleur")
-            self._show_caption_tooltip(event.x_root, event.y_root)
-            return
         cx, cy = self._cxy(event)
 
         # Blue split line — show a directional drag cursor
@@ -706,13 +735,6 @@ class ImageCanvas(tk.Frame):
         if split is not None:
             cur = "sb_h_double_arrow" if split.orient == "vertical" else "sb_v_double_arrow"
             self.canvas.config(cursor=cur)
-            self._tooltip.hide()
-            return
-
-        # Caption box — move cursor
-        cb = self._hit_caption_box(cx, cy)
-        if cb is not None:
-            self.canvas.config(cursor="fleur")
             self._tooltip.hide()
             return
 
@@ -755,17 +777,6 @@ class ImageCanvas(tk.Frame):
             menu.tk_popup(event.x_root, event.y_root)
             return
 
-        # ── right-click on a caption box ──
-        cb = self._hit_caption_box(cx, cy)
-        if cb is not None:
-            menu = tk.Menu(self, tearoff=0)
-            menu.add_command(
-                label="Remove Caption Box",
-                command=lambda b=cb: self._remove_caption_box(b),
-            )
-            menu.tk_popup(event.x_root, event.y_root)
-            return
-
         # ── right-click on a box or empty canvas ──
         box, _ = self._hit_box(cx, cy)
         if box is not None and box is not self._active:
@@ -777,6 +788,11 @@ class ImageCanvas(tk.Frame):
                 label="Delete Box",
                 command=lambda b=box: self._delete_box(b),
             )
+            for adj_box, direction in self._find_adjacent(box):
+                menu.add_command(
+                    label=f"Merge with Box to the {direction.capitalize()}",
+                    command=lambda b=box, o=adj_box: self._merge_boxes(b, o),
+                )
             menu.add_separator()
         else:
             # Offer undo if click is within the bounds of the last deleted box
@@ -845,67 +861,55 @@ class ImageCanvas(tk.Frame):
         self._redraw()
         self._notify_change()
 
-    # ── caption-box helpers ───────────────────────────────────────────────────
+    def _nearest_other_box(self, ref: PhotoBox) -> Optional[PhotoBox]:
+        """Return the photo box whose centre is closest to ref's centre (excluding ref)."""
+        rx = (ref.x1 + ref.x2) / 2
+        ry = (ref.y1 + ref.y2) / 2
+        best: Optional[PhotoBox] = None
+        best_d = float("inf")
+        for b in self._boxes:
+            if b is ref:
+                continue
+            d = ((b.x1 + b.x2) / 2 - rx) ** 2 + ((b.y1 + b.y2) / 2 - ry) ** 2
+            if d < best_d:
+                best_d = d
+                best = b
+        return best
 
-    def _show_caption_tooltip(self, x_root: int, y_root: int) -> None:
-        """Show (or reposition) the OCR-preview tooltip during a caption drag."""
-        text = self._caption_drag.get("ocr_text") if self._caption_drag else None
-        if text is None:
-            return
-        self._tooltip.show_now(text or "(no text recognized)", x_root, y_root)
+    # ── drag ghost ────────────────────────────────────────────────────────────
 
-    def _remove_caption_box(self, cb: CaptionBox) -> None:
-        if cb in self._caption_boxes:
-            self._caption_boxes.remove(cb)
-        self._redraw()
+    def _show_drag_ghost(self, x_root: int, y_root: int, text: str) -> None:
+        """Create or reposition the amber ghost Toplevel that follows the cursor."""
+        if self._drag_ghost is not None and self._drag_ghost.winfo_exists():
+            self._drag_ghost.wm_geometry(f"+{x_root + 14}+{y_root + 14}")
+            for child in self._drag_ghost.winfo_children():
+                child.config(text=text)   # type: ignore[call-arg]
+        else:
+            win = tk.Toplevel(self.canvas)
+            win.wm_overrideredirect(True)
+            win.wm_attributes("-topmost", True)
+            win.wm_geometry(f"+{x_root + 14}+{y_root + 14}")
+            tk.Label(
+                win, text=text,
+                background="#FFB800", foreground="#000000",
+                relief="solid", borderwidth=1,
+                justify=tk.LEFT, padx=8, pady=4,
+                font=("TkDefaultFont", 9),
+            ).pack()
+            self._drag_ghost = win
 
-    def _try_drop_caption(
-        self,
-        cb: CaptionBox,
-        x_root: int,
-        y_root: int,
-        ocr_text: Optional[str] = None,
-    ) -> None:
-        """
-        Called when a caption box is released.  Two drop targets are checked:
-        1. Caption field in the Photo Information panel → active photo box.
-        2. Any green photo box on the canvas → that specific photo box.
-        """
-        text = ocr_text if ocr_text is not None else self._ocr_region(cb)
+    def _hide_drag_ghost(self) -> None:
+        """Destroy the drag ghost if it exists."""
+        if self._drag_ghost is not None:
+            if self._drag_ghost.winfo_exists():
+                self._drag_ghost.destroy()
+            self._drag_ghost = None
 
-        target: Optional[PhotoBox] = None
+    # ── OCR helper ────────────────────────────────────────────────────────────
 
-        # ── target 1: Caption text widget in the info panel ──────────────────
-        if self._caption_drop_widget is not None and self._active is not None:
-            w = self._caption_drop_widget
-            if (w.winfo_rootx() <= x_root <= w.winfo_rootx() + w.winfo_width() and
-                    w.winfo_rooty() <= y_root <= w.winfo_rooty() + w.winfo_height()):
-                target = self._active
-
-        # ── target 2: any green photo box on the canvas ───────────────────────
-        if target is None:
-            x_widget = x_root - self.canvas.winfo_rootx()
-            y_widget = y_root - self.canvas.winfo_rooty()
-            cx = self.canvas.canvasx(x_widget)
-            cy = self.canvas.canvasy(y_widget)
-            hit, _ = self._hit_box(cx, cy)
-            if hit is not None:
-                target = hit
-
-        if target is None:
-            return
-
-        target.meta.caption = text
-        self._caption_boxes.remove(cb)
-        was_active = target is self._active
-        self._active = target          # selects the box; fires callback if it changed
-        self._redraw()
-        if was_active and self._on_select_callback is not None:
-            self._on_select_callback(target)   # force panel refresh if already active
-        self._notify_change()
-
-    def _ocr_region(self, cb: CaptionBox) -> str:
-        """OCR the image pixels inside cb; return stripped text or error message."""
+    def _ocr_region(self, region) -> str:
+        """OCR the image pixels inside region (any object with x1/y1/x2/y2).
+        Returns stripped text, or an error string on failure."""
         if self._pil_image is None:
             return ""
         try:
@@ -915,10 +919,10 @@ class ImageCanvas(tk.Frame):
                 default = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
                 if os.path.isfile(default):
                     pytesseract.pytesseract.tesseract_cmd = default
-            x1 = max(0, round(cb.x1))
-            y1 = max(0, round(cb.y1))
-            x2 = min(self._pil_image.width,  round(cb.x2))
-            y2 = min(self._pil_image.height, round(cb.y2))
+            x1 = max(0, round(region.x1))
+            y1 = max(0, round(region.y1))
+            x2 = min(self._pil_image.width,  round(region.x2))
+            y2 = min(self._pil_image.height, round(region.y2))
             if x2 <= x1 or y2 <= y1:
                 return ""
             crop = self._pil_image.crop((x1, y1, x2, y2))
@@ -1063,6 +1067,65 @@ class ImageCanvas(tk.Frame):
                 return mid
             means = gray[lo : hi + 1, bx1:bx2].mean(axis=1)
             return float(lo + int(np.argmax(means)))
+
+    # ── merge ─────────────────────────────────────────────────────────────────
+
+    def _find_adjacent(self, box: PhotoBox) -> List[Tuple["PhotoBox", str]]:
+        """
+        Return (other, direction) for every box that is adjacent to *box*.
+        'adjacent' means the gap between the two facing edges is ≤ _MERGE_GAP_PX
+        and the boxes overlap by at least _MERGE_OVERLAP_FRAC of the smaller
+        perpendicular extent.
+        """
+        _MERGE_GAP_PX       = 40   # image pixels
+        _MERGE_OVERLAP_FRAC = 0.30
+
+        result: List[Tuple[PhotoBox, str]] = []
+        for other in self._boxes:
+            if other is box:
+                continue
+
+            y_overlap = max(0.0, min(box.y2, other.y2) - max(box.y1, other.y1))
+            x_overlap = max(0.0, min(box.x2, other.x2) - max(box.x1, other.x1))
+            y_frac = y_overlap / min(box.height, other.height) if min(box.height, other.height) > 0 else 0.0
+            x_frac = x_overlap / min(box.width,  other.width)  if min(box.width,  other.width)  > 0 else 0.0
+
+            if 0 <= other.x1 - box.x2 <= _MERGE_GAP_PX and y_frac >= _MERGE_OVERLAP_FRAC:
+                result.append((other, "right"))
+            elif 0 <= box.x1 - other.x2 <= _MERGE_GAP_PX and y_frac >= _MERGE_OVERLAP_FRAC:
+                result.append((other, "left"))
+            elif 0 <= other.y1 - box.y2 <= _MERGE_GAP_PX and x_frac >= _MERGE_OVERLAP_FRAC:
+                result.append((other, "below"))
+            elif 0 <= box.y1 - other.y2 <= _MERGE_GAP_PX and x_frac >= _MERGE_OVERLAP_FRAC:
+                result.append((other, "above"))
+
+        return result
+
+    def _merge_boxes(self, box: PhotoBox, other: PhotoBox) -> None:
+        """Replace *box* and *other* with their bounding-box union."""
+        merged = PhotoBox(
+            min(box.x1, other.x1), min(box.y1, other.y1),
+            max(box.x2, other.x2), max(box.y2, other.y2),
+            deepcopy(box.meta),
+        )
+        # Fill in any metadata that box was missing but other had
+        if not merged.meta.caption and other.meta.caption:
+            merged.meta.caption = other.meta.caption
+        if not merged.meta.date and other.meta.date:
+            merged.meta.date = other.meta.date
+        if not merged.meta.source and other.meta.source:
+            merged.meta.source = other.meta.source
+
+        lo = min(self._boxes.index(box), self._boxes.index(other))
+        for b in (box, other):
+            self._splits = [s for s in self._splits if s.box is not b]
+            if b in self._boxes:
+                self._boxes.remove(b)
+        self._boxes.insert(lo, merged)
+        self._last_deleted = None
+        self._active = merged
+        self._redraw()
+        self._notify_change()
 
     def _do_split(self, box: PhotoBox, pos: float, orient: str) -> None:
         """

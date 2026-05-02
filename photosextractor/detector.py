@@ -1,9 +1,26 @@
 """
 Photo region detection for scanned document pages.
 
-Strategy: Gaussian blur to dissolve halftone dots, Otsu binarisation,
-morphological opening to erase thin text strokes, morphological closing
-to fill photo interiors, then contour filtering by area and aspect ratio.
+Primary pass
+────────────
+Gaussian blur → Otsu binarisation (inverted) → morphological opening to
+erase thin text strokes → morphological closing to fill photo interiors →
+contour filtering by area, aspect ratio, and a text-vs-photo discriminator.
+
+Supplementary pass (light halftone)
+────────────────────────────────────
+Photos printed with a light halftone (high-key images) average to a
+medium-gray local mean even when most of their pixels exceed Otsu's
+threshold.  A large box-filter captures this mean; pixels in a medium-gray
+band (darker than blank paper but lighter than ink) are closed into blobs
+and merged with the primary result.
+
+Text discriminator
+──────────────────
+Text columns produce strongly oscillating row-mean brightness (alternating
+dark text lines and white inter-line gaps).  Candidate regions whose
+row-mean standard deviation is disproportionately larger than their
+column-mean standard deviation are rejected as text.
 
 If pytesseract is available the strip of text immediately below each
 detected photo is OCR'd and returned as an initial caption.
@@ -122,6 +139,181 @@ def _detect_caption(gray: np.ndarray, region: PhotoRegion) -> str:
         return ""
 
 
+# ── text-vs-photo discriminator ───────────────────────────────────────────────
+
+def _looks_like_text(
+    gray: np.ndarray, rx: int, ry: int, rw: int, rh: int
+) -> bool:
+    """
+    Return True when the region looks like a text column rather than a photo.
+
+    Text columns have strongly oscillating row-mean brightness (alternating
+    dark text lines and white inter-line gaps); halftone photos produce a
+    smoother, more isotropic intensity pattern where row and column variation
+    are similar in magnitude.
+    """
+    y1 = max(0, ry);  y2 = min(gray.shape[0], ry + rh)
+    x1 = max(0, rx);  x2 = min(gray.shape[1], rx + rw)
+    patch = gray[y1:y2, x1:x2]
+    if patch.size < 400:
+        return False
+
+    # Dark/medium regions are almost certainly halftone — never reject them.
+    if float(patch.mean()) < 168:
+        return False
+
+    row_std = float(np.std(patch.mean(axis=1)))
+    col_std = float(np.std(patch.mean(axis=0))) + 0.5   # +0.5 avoids /0
+
+    # Reject when horizontal oscillation far exceeds vertical oscillation
+    # (the signature of regularly-spaced text lines) AND the oscillation is
+    # large enough to rule out a uniform/lightly-printed region.
+    return row_std / col_std > 2.5 and row_std > 10
+
+
+def _region_overlaps(r1: "PhotoRegion", r2: "PhotoRegion") -> bool:
+    """True if the two regions overlap by more than half the smaller one's area."""
+    ix1 = max(r1.x1, r2.x1);  iy1 = max(r1.y1, r2.y1)
+    ix2 = min(r1.x2, r2.x2);  iy2 = min(r1.y2, r2.y2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return False
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    smaller = min(r1.width * r1.height, r2.width * r2.height)
+    return inter > 0.5 * smaller
+
+
+def _find_white_corridor(coverage: np.ndarray, min_width: int) -> int:
+    """
+    Find the centre of the widest run in *coverage* where every element ≥ 0.90.
+    *coverage* is a 1-D array of per-column (or per-row) white-pixel fractions.
+    Returns the 0-based index of the corridor centre, or -1 if none qualifies.
+    """
+    best_center = -1
+    best_width  = 0
+    run_start   = -1
+    n = len(coverage)
+    for i in range(n + 1):
+        in_run = i < n and coverage[i] >= 0.90
+        if in_run:
+            if run_start < 0:
+                run_start = i
+        else:
+            if run_start >= 0:
+                run_len = i - run_start
+                if run_len >= min_width and run_len > best_width:
+                    best_width  = run_len
+                    best_center = run_start + run_len // 2
+                run_start = -1
+    return best_center
+
+
+def _try_corridor_split(
+    gray: np.ndarray,
+    region: "PhotoRegion",
+    white_thr: float,
+) -> List["PhotoRegion"]:
+    """
+    If *region* contains an internal near-white corridor that spans most of its
+    height (vertical split → left/right) or width (horizontal split → top/bottom),
+    return the two halves.  Otherwise return [region].
+
+    The search is restricted to the middle 60 % of each axis so that white photo
+    borders do not trigger spurious splits.
+    """
+    x1, y1 = region.x1, region.y1
+    x2, y2 = region.x2, region.y2
+    patch = gray[max(0, y1):min(gray.shape[0], y2),
+                 max(0, x1):min(gray.shape[1], x2)]
+    rh, rw = patch.shape
+    if rh < 40 or rw < 40:
+        return [region]
+
+    margin    = 0.20                         # ignore outer 20 % on each side
+    min_width = max(5, min(rw, rh) // 25)   # corridor must be at least this wide
+
+    # ── vertical corridor → left / right ─────────────────────────────────────
+    c_lo, c_hi = int(rw * margin), int(rw * (1 - margin))
+    if c_hi > c_lo + min_width:
+        # fraction of pixels ≥ white_thr in each column
+        col_cov = (patch[:, c_lo:c_hi] >= white_thr).mean(axis=0)
+        cx = _find_white_corridor(col_cov, min_width)
+        if cx >= 0:
+            split_x = x1 + c_lo + cx
+            left  = PhotoRegion(x1, y1, split_x, y2)
+            right = PhotoRegion(split_x, y1, x2, y2)
+            if left.width >= 20 and right.width >= 20:
+                return [left, right]
+
+    # ── horizontal corridor → top / bottom ───────────────────────────────────
+    r_lo, r_hi = int(rh * margin), int(rh * (1 - margin))
+    if r_hi > r_lo + min_width:
+        row_cov = (patch[r_lo:r_hi, :] >= white_thr).mean(axis=1)
+        ry = _find_white_corridor(row_cov, min_width)
+        if ry >= 0:
+            split_y = y1 + r_lo + ry
+            top    = PhotoRegion(x1, y1, x2, split_y)
+            bottom = PhotoRegion(x1, split_y, x2, y2)
+            if top.height >= 20 and bottom.height >= 20:
+                return [top, bottom]
+
+    return [region]
+
+
+def _nms_regions(regions: List["PhotoRegion"]) -> List["PhotoRegion"]:
+    """
+    Non-maximum suppression: remove any region whose area is more than 60 %
+    covered by a larger already-kept region.  This cleans up small sub-blobs
+    that the closing step left inside a single larger photo.
+    """
+    ordered = sorted(regions, key=lambda r: r.width * r.height, reverse=True)
+    keep: List[PhotoRegion] = []
+    for cand in ordered:
+        c_area = cand.width * cand.height
+        dominated = False
+        for larger in keep:
+            ix1 = max(cand.x1, larger.x1);  iy1 = max(cand.y1, larger.y1)
+            ix2 = min(cand.x2, larger.x2);  iy2 = min(cand.y2, larger.y2)
+            if ix2 > ix1 and iy2 > iy1:
+                if (ix2 - ix1) * (iy2 - iy1) > 0.60 * c_area:
+                    dominated = True
+                    break
+        if not dominated:
+            keep.append(cand)
+    return keep
+
+
+def _contours_to_regions(
+    gray: np.ndarray,
+    contours,
+    min_area: int,
+    img_w: int,
+    img_h: int,
+    max_mean_gray: float = 255.0,
+) -> List["PhotoRegion"]:
+    """Apply all geometric and texture filters to a contour list."""
+    out: List[PhotoRegion] = []
+    for cnt in contours:
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        if cw * ch < min_area:
+            continue
+        if cw < 20 or ch < 20:
+            continue
+        if max(cw, ch) > 6 * min(cw, ch):      # 6:1 max aspect ratio
+            continue
+        if cw > 0.92 * img_w and ch > 0.92 * img_h:
+            continue
+        if _looks_like_text(gray, x, y, cw, ch):
+            continue
+        if max_mean_gray < 255:
+            y2 = min(gray.shape[0], y + ch)
+            x2 = min(gray.shape[1], x + cw)
+            patch = gray[max(0, y):y2, max(0, x):x2]
+            if patch.size > 0 and float(patch.mean()) > max_mean_gray:
+                continue
+        out.append(PhotoRegion(x, y, x + cw, y + ch))
+    return out
+
+
 # ── main detection ────────────────────────────────────────────────────────────
 
 def _detect_from_gray(
@@ -136,50 +328,102 @@ def _detect_from_gray(
 
     h, w = gray.shape
     min_area = max(1_000, int(min_area_fraction * h * w))
+    bg_level = float(np.percentile(gray.ravel(), 95))   # ≈ blank-paper brightness
 
-    prog(20, "Smoothing…")
+    # ── primary pass ──────────────────────────────────────────────────────────
+
+    prog(15, "Smoothing…")
     blurred = cv2.GaussianBlur(gray, (7, 7), 2)
 
-    prog(32, "Binarising…")
+    prog(26, "Binarising…")
     _, binary = cv2.threshold(
         blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
     )
 
-    prog(46, "Removing text strokes…")
-    stroke_px = max(5, h // 200)
+    prog(37, "Removing text strokes…")
+    # Keep the opening kernel small so sparse halftone dots (1-4 px at 150 dpi)
+    # survive.  The _looks_like_text discriminator handles text blobs that
+    # also survive.
+    stroke_px = max(2, h // 500)
     open_k = np.ones((stroke_px, stroke_px), np.uint8)
     no_text = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_k)
 
-    prog(60, "Filling photo regions…")
-    fill_px = stroke_px * 4
+    prog(48, "Filling photo regions…")
+    # Closing kernel sized independently of stroke_px so it stays large enough
+    # to bridge the gaps between halftone dots regardless of stroke_px.
+    fill_px = max(20, h // 100)
     close_k = np.ones((fill_px, fill_px), np.uint8)
     filled = cv2.morphologyEx(no_text, cv2.MORPH_CLOSE, close_k, iterations=2)
 
-    prog(74, "Finding contours…")
-    contours, _ = cv2.findContours(
+    prog(59, "Finding primary contours…")
+    contours1, _ = cv2.findContours(
         filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
+    regions = _contours_to_regions(gray, contours1, min_area, w, h)
 
-    regions: List[PhotoRegion] = []
-    for cnt in contours:
-        x, y, cw, ch = cv2.boundingRect(cnt)
-        if cw * ch < min_area:
-            continue
-        if cw < 20 or ch < 20:
-            continue
-        if max(cw, ch) > 8 * min(cw, ch):
-            continue
-        if cw > 0.92 * w and ch > 0.92 * h:
-            continue
-        regions.append(PhotoRegion(x, y, x + cw, y + ch))
+    # ── supplementary pass: light / white-bordered halftone ───────────────────
+    # Run as a completely separate pipeline and merge at the region level so
+    # that the large blobs it may produce cannot swallow the primary detections.
+    #
+    # A lightly-printed halftone averages to medium gray over a wide window
+    # even when most individual pixels exceed Otsu's threshold.  The band
+    # bg−80 … bg−15 catches photos down to ~15 % halftone density; text is
+    # screened by _looks_like_text and the max_mean_gray cap.
+
+    prog(65, "Searching for light halftone…")
+    blur_w = max(31, h // 50)
+    if blur_w % 2 == 0:
+        blur_w += 1
+    local_mean = cv2.blur(gray, (blur_w, blur_w))
+    med_lo     = max(0.0, bg_level - 80)
+    # Widen the upper bound: photos with ~15 % halftone density average to
+    # roughly bg-20 over a large window; the previous bg-40 cut-off missed them.
+    # _looks_like_text and max_mean_gray still screen out text that bleeds in.
+    med_hi     = bg_level - 15
+    if med_hi > med_lo:
+        medium_mask = (
+            (local_mean.astype(np.float32) >= med_lo) &
+            (local_mean.astype(np.float32) <  med_hi)
+        ).astype(np.uint8) * 255
+        mg_fill = max(fill_px, h // 40)
+        mg_k    = np.ones((mg_fill, mg_fill), np.uint8)
+        medium_filled = cv2.morphologyEx(
+            medium_mask, cv2.MORPH_CLOSE, mg_k, iterations=2
+        )
+        contours2, _ = cv2.findContours(
+            medium_filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        # Cap raised to match wider band; _looks_like_text handles any text
+        # columns that slip through.
+        for r in _contours_to_regions(
+            gray, contours2, min_area, w, h, max_mean_gray=225.0
+        ):
+            if not any(_region_overlaps(r, existing) for existing in regions):
+                regions.append(r)
+
+    # ── post-processing ───────────────────────────────────────────────────────
+
+    prog(74, "Refining regions…")
+
+    # Pass 1 — split any region that has an internal white corridor:
+    # handles two photos joined by the closing step when the gap between them
+    # was narrower than the closing radius.
+    white_thr = max(228.0, bg_level - 18.0)
+    split_out: List[PhotoRegion] = []
+    for r in regions:
+        split_out.extend(_try_corridor_split(gray, r, white_thr))
+
+    # Pass 2 — non-maximum suppression: remove small sub-blobs that are mostly
+    # inside a larger detected region (halftone fragments left by the pipeline).
+    regions = _nms_regions(split_out)
 
     regions = sorted(regions, key=lambda r: (r.y1, r.x1))
 
     if _TESS and regions:
-        prog(84, "Detecting captions…")
+        prog(78, "Detecting captions…")
         for i, region in enumerate(regions):
             region.caption = _detect_caption(gray, region)
-            pct = 84 + round(12 * (i + 1) / len(regions))
+            pct = 78 + round(18 * (i + 1) / len(regions))
             prog(pct, f"Detecting captions… ({i + 1}/{len(regions)})")
 
     prog(100, "Done")
