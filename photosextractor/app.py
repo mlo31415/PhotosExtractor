@@ -33,7 +33,12 @@ _ALL_FILE_TYPES = [
 
 def _settings_path() -> Path:
     """Settings file lives beside the running script / frozen exe."""
-    return Path(sys.argv[0]).resolve().parent / "px_settings.json"
+    base = Path(sys.argv[0]).resolve().parent
+    new = base / "PhotosExtractor Settings.json"
+    old = base / "px_settings.json"
+    if not new.exists() and old.exists():
+        old.rename(new)   # migrate from old name on first run
+    return new
 
 def _load_settings() -> dict:
     try:
@@ -863,6 +868,7 @@ class App:
 
         if saved:
             self._page_dirty = False
+            self._persist_geometry()   # write output folder, default date & source immediately
         if errors:
             messagebox.showerror(
                 "Save — Errors",
