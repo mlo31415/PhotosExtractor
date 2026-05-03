@@ -155,9 +155,8 @@ def _save_jpg(img: Image.Image, dest: Path, meta) -> None:
             exif["0th"][piexif.ImageIFD.Artist] = meta.source.encode("utf-8")
         if dt is not None:
             exif_dt = dt.strftime("%Y:%m:%d %H:%M:%S").encode("ascii")
-            exif["0th"][piexif.ImageIFD.DateTime]              = exif_dt
-            exif["Exif"][piexif.ExifIFD.DateTimeOriginal]      = exif_dt
-            exif["Exif"][piexif.ExifIFD.DateTimeDigitized]     = exif_dt
+            exif["Exif"][piexif.ExifIFD.DateTimeOriginal]  = exif_dt
+            exif["Exif"][piexif.ExifIFD.DateTimeDigitized] = exif_dt
         img.save(str(dest), "JPEG", quality=92, exif=piexif.dump(exif))
     except ImportError:
         # piexif unavailable — fall back to JPEG comment marker
