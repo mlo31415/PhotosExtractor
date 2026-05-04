@@ -63,7 +63,7 @@ def _sanitize(text: str) -> str:
     """Convert arbitrary text to a safe filename stem."""
     # Control characters (0x00-0x1F, DEL) plus Windows-illegal chars
     safe = re.sub(r'[\x00-\x1f\x7f\\/:*?"<>|]', "_", text).strip(". ")
-    return safe[:100] or "photo"
+    return safe[:251] or "photo"
 
 
 def _clean_folder_path(raw: str) -> str:
