@@ -971,7 +971,8 @@ class ImageCanvas(tk.Frame):
             if x2 <= x1 or y2 <= y1:
                 return ""
             crop = self._pil_image.crop((x1, y1, x2, y2))
-            return pytesseract.image_to_string(crop, config="--psm 6").strip()
+            raw = pytesseract.image_to_string(crop, config="--psm 6")
+            return " ".join(raw.split())
         except Exception as exc:
             if "TesseractNotFound" in type(exc).__name__:
                 _warn_tesseract_missing()
