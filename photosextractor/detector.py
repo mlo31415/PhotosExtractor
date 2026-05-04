@@ -314,6 +314,122 @@ def _contours_to_regions(
     return out
 
 
+# ── background-text removal (pre-process before detection) ────────────────────
+
+def remove_page_text(
+    pil_image: "_PILImage.Image",
+    debug: bool = False,
+) -> "tuple":
+    """
+    Return a copy of *pil_image* with text on the page background replaced by
+    the background colour, so that photo detection runs on a text-free image.
+
+    Primary path: Tesseract full-page OCR (--psm 3).  Tesseract is used here
+    because it is purpose-built for finding text and will not false-fire on
+    photo content (dark jacket folds, photo edges, etc.) the way any brightness-
+    threshold approach will.  Each detected word's bounding box — expanded by a
+    small pad — is filled with the background colour, guaranteeing that no
+    letter is cut in half at its edge.
+
+    Fallback (Tesseract unavailable): morphological ink-on-background detection.
+
+    Returns (cleaned_image, debug_image_or_none).
+    """
+    if not _PIL:
+        return pil_image, None
+
+    rgb      = np.array(pil_image.convert("RGB"))
+    gray_arr = np.array(pil_image.convert("L"))
+    h, w     = gray_arr.shape
+    bg_fill  = int(np.percentile(gray_arr.ravel(), 95))
+
+    # ── Primary: Tesseract ────────────────────────────────────────────────────
+    if _TESS:
+        try:
+            import os as _os, shutil as _sh
+            if not _sh.which("tesseract"):
+                _default = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+                if _os.path.isfile(_default):
+                    _tess.pytesseract.tesseract_cmd = _default
+        except Exception:
+            pass
+
+        try:
+            data = _tess.image_to_data(
+                _PILImage.fromarray(gray_arr),
+                config="--psm 3",
+                output_type=_tess.Output.DICT,
+            )
+            pad       = 5
+            text_mask = np.zeros((h, w), dtype=bool)
+
+            for j in range(len(data["text"])):
+                word = str(data["text"][j]).strip()
+                if not word:
+                    continue
+                try:
+                    conf = int(data["conf"][j])
+                except (ValueError, TypeError):
+                    continue
+                if conf < 10:
+                    continue
+                tx  = int(data["left"][j])
+                ty  = int(data["top"][j])
+                tx2 = tx + int(data["width"][j])
+                ty2 = ty + int(data["height"][j])
+                if tx2 > tx and ty2 > ty:
+                    text_mask[
+                        max(0, ty - pad) : min(h, ty2 + pad),
+                        max(0, tx - pad) : min(w, tx2 + pad),
+                    ] = True
+
+            result = rgb.copy()
+            result[text_mask] = bg_fill
+            debug_image = _make_debug_overlay(result, text_mask, h, w) if debug else None
+            return _PILImage.fromarray(result), debug_image
+
+        except Exception:
+            pass   # fall through to morphological
+
+    # ── Fallback: morphological ink-on-background detection ──────────────────
+    if not _CV2:
+        return pil_image, None
+
+    gray      = gray_arr.astype(np.float32)
+    bg_level  = float(bg_fill)
+    blur_px   = max(31, min(h, w) // 15)
+    if blur_px % 2 == 0:
+        blur_px += 1
+    local_mean = cv2.blur(gray, (blur_px, blur_px))
+
+    ink_thresh = bg_level - 50
+    bg_thresh  = bg_level - 40
+    text_ink   = ((gray < ink_thresh) & (local_mean > bg_thresh)).astype(np.uint8) * 255
+
+    expand_px     = max(4, min(h, w) // 200)
+    k             = np.ones((expand_px * 2 + 1, expand_px * 2 + 1), np.uint8)
+    text_expanded = cv2.dilate(text_ink, k)
+    text_mask     = (text_expanded > 0) & (local_mean > bg_thresh)
+
+    result = rgb.copy()
+    result[text_mask] = bg_fill
+    debug_image = _make_debug_overlay(result, text_mask, h, w) if debug else None
+    return _PILImage.fromarray(result), debug_image
+
+
+def _make_debug_overlay(
+    result_rgb: "np.ndarray",
+    text_mask:  "np.ndarray",
+    h: int,
+    w: int,
+) -> "_PILImage.Image":
+    overlay_arr = np.zeros((h, w, 4), dtype=np.uint8)
+    overlay_arr[text_mask] = [0, 200, 0, 120]
+    overlay = _PILImage.fromarray(overlay_arr, "RGBA")
+    base    = _PILImage.fromarray(result_rgb).convert("RGBA")
+    return _PILImage.alpha_composite(base, overlay).convert("RGB")
+
+
 # ── text-masking post-process (called from app after detection) ───────────────
 
 def mask_text_in_regions(

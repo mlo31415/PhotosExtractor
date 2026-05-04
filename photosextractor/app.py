@@ -15,7 +15,7 @@ from typing import Optional
 from PIL import Image
 
 from .canvas import ImageCanvas
-from .detector import detect_photos, detect_photos_pil, mask_text_in_regions
+from .detector import detect_photos_pil, remove_page_text
 
 _IMAGE_TYPES = [
     ("Image files", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.gif *.webp *.pgm"),
@@ -400,20 +400,19 @@ class App:
         self._run_detection_pil(pil)
 
     def _run_detection_pil(self, pil_image: Image.Image) -> None:
-        img   = pil_image
-        dbg   = self._debug_text_recognition
+        img = pil_image
+        dbg = self._debug_text_recognition
         def _worker() -> None:
             try:
+                self.root.after(0, lambda: self._set_status("Removing background text…"))
+                cleaned_img, dbg_img = remove_page_text(img, debug=dbg)
                 regions = detect_photos_pil(
-                    img,
+                    cleaned_img,
                     progress=lambda _p, msg: self.root.after(
                         0, lambda m=msg: self._set_status(m)
                     ),
                 )
-                self.root.after(0, lambda: self._set_status(
-                    f"Scanning {len(regions)} box(es) for text…"))
-                masked_img, regions, dbg_img = mask_text_in_regions(img, regions, debug=dbg)
-                self.root.after(0, lambda r=regions, m=masked_img, d=dbg_img: self._on_done(r, m, d))
+                self.root.after(0, lambda r=regions, m=cleaned_img, d=dbg_img: self._on_done(r, m, d))
             except Exception as exc:
                 self.root.after(0, lambda e=str(exc): self._on_error(e))
         threading.Thread(target=_worker, daemon=True).start()
@@ -980,16 +979,15 @@ class App:
         dbg = self._debug_text_recognition
         def _worker() -> None:
             try:
-                regions = detect_photos(
-                    path,
+                self.root.after(0, lambda: self._set_status("Removing background text…"))
+                cleaned_img, dbg_img = remove_page_text(img, debug=dbg)
+                regions = detect_photos_pil(
+                    cleaned_img,
                     progress=lambda _p, msg: self.root.after(
                         0, lambda m=msg: self._set_status(m)
                     ),
                 )
-                self.root.after(0, lambda: self._set_status(
-                    f"Scanning {len(regions)} box(es) for text…"))
-                masked_img, regions, dbg_img = mask_text_in_regions(img, regions, debug=dbg)
-                self.root.after(0, lambda r=regions, m=masked_img, d=dbg_img: self._on_done(r, m, d))
+                self.root.after(0, lambda r=regions, m=cleaned_img, d=dbg_img: self._on_done(r, m, d))
             except Exception as exc:
                 self.root.after(0, lambda e=str(exc): self._on_error(e))
 
@@ -1021,7 +1019,7 @@ class App:
         """Pop up a non-modal window showing the text-recognition debug overlay."""
         from PIL import ImageTk as _ITk
         win = tk.Toplevel(self.root)
-        win.title("Debug: Text Recognition  —  green = no text found   red = text found")
+        win.title("Debug: Text Recognition  —  green = background text removed")
         win.transient(self.root)
 
         # Scale to fit a reasonable screen area
