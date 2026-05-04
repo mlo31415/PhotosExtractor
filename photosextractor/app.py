@@ -561,6 +561,11 @@ class App:
         self._caption_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._caption_text.bind("<<Modified>>", self._on_caption_modified)
 
+        self._caption_warn = tk.Label(
+            panel, text="", anchor="w", fg="#cc0000", font=("TkDefaultFont", 8),
+        )
+        self._caption_warn.pack(fill=tk.X, padx=10, pady=(0, 4))
+
         # Date/Time
         tk.Label(panel, text="Date/Time:", anchor="w").pack(fill=tk.X, padx=10)
         self._panel_date_var = tk.StringVar()
@@ -713,6 +718,7 @@ class App:
                 self._panel_date_entry.config(state=tk.DISABLED, bg="white")
                 self._panel_source_var.set("")
                 self._panel_source_entry.config(state=tk.DISABLED)
+                self._caption_warn.config(text="")
             else:
                 self._caption_text.config(state=tk.NORMAL)
                 self._caption_text.delete("1.0", tk.END)
@@ -722,16 +728,31 @@ class App:
                 self._panel_date_entry.config(state=tk.NORMAL)
                 self._panel_source_var.set(box.meta.source)
                 self._panel_source_entry.config(state=tk.NORMAL)
+                self._update_caption_warn(box.meta.caption)
         finally:
             self._info_panel_loading = False
+
+    _CAPTION_FILENAME_LIMIT = 251  # max stem length: NTFS 255 minus len(".jpg")
 
     def _on_caption_modified(self, _event=None) -> None:
         if self._info_panel_loading or self._info_box is None:
             self._caption_text.edit_modified(False)
             return
-        self._info_box.meta.caption = self._caption_text.get("1.0", "end-1c")
+        text = self._caption_text.get("1.0", "end-1c")
+        self._info_box.meta.caption = text
         self._caption_text.edit_modified(False)
         self._mark_page_dirty()
+        self._update_caption_warn(text)
+
+    def _update_caption_warn(self, caption: str) -> None:
+        first = caption.split("\n")[0]
+        n = len(first)
+        if n > self._CAPTION_FILENAME_LIMIT:
+            self._caption_warn.config(
+                text=f"First line: {n} chars — filename capped at {self._CAPTION_FILENAME_LIMIT}"
+            )
+        else:
+            self._caption_warn.config(text="")
 
     def _on_panel_date_changed(self, *_) -> None:
         if self._info_panel_loading:
