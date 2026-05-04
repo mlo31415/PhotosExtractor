@@ -15,7 +15,7 @@ from typing import Optional
 from PIL import Image
 
 from .canvas import ImageCanvas
-from .detector import detect_photos, detect_photos_pil
+from .detector import detect_photos, detect_photos_pil, mask_text_in_regions
 
 _IMAGE_TYPES = [
     ("Image files", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.gif *.webp *.pgm"),
@@ -193,6 +193,7 @@ class App:
         self._geo_save_id: Optional[str]         = None
         self._info_box                           = None   # currently displayed PhotoBox
         self._info_panel_loading: bool           = False
+        self._debug_text_recognition: bool       = False
 
         # PDF state
         self._pdf_doc    = None   # fitz.Document when a PDF is open, else None
@@ -399,7 +400,8 @@ class App:
         self._run_detection_pil(pil)
 
     def _run_detection_pil(self, pil_image: Image.Image) -> None:
-        img = pil_image
+        img   = pil_image
+        dbg   = self._debug_text_recognition
         def _worker() -> None:
             try:
                 regions = detect_photos_pil(
@@ -408,7 +410,10 @@ class App:
                         0, lambda m=msg: self._set_status(m)
                     ),
                 )
-                self.root.after(0, lambda r=regions: self._on_done(r))
+                self.root.after(0, lambda: self._set_status(
+                    f"Scanning {len(regions)} box(es) for text…"))
+                masked_img, regions, dbg_img = mask_text_in_regions(img, regions, debug=dbg)
+                self.root.after(0, lambda r=regions, m=masked_img, d=dbg_img: self._on_done(r, m, d))
             except Exception as exc:
                 self.root.after(0, lambda e=str(exc): self._on_error(e))
         threading.Thread(target=_worker, daemon=True).start()
@@ -600,6 +605,7 @@ class App:
         self._default_date_var.set(s.get("default_date", ""))
         self._default_source_var.set(s.get("default_source", ""))
         self._output_folder_var.set(s.get("output_folder", ""))
+        self._debug_text_recognition = bool(s.get("Debug_Recognized_Text", False))
 
     def _on_configure(self, event: tk.Event) -> None:
         if event.widget is not self.root:
@@ -613,10 +619,11 @@ class App:
 
     def _persist_geometry(self) -> None:
         s = _load_settings()
-        s["geometry"]       = self.root.geometry()
-        s["default_date"]   = self._default_date_var.get()
-        s["default_source"] = self._default_source_var.get()
-        s["output_folder"]  = self._output_folder_var.get()
+        s["geometry"]                = self.root.geometry()
+        s["default_date"]            = self._default_date_var.get()
+        s["default_source"]          = self._default_source_var.get()
+        s["output_folder"]           = self._output_folder_var.get()
+        s.setdefault("Debug_Recognized_Text", self._debug_text_recognition)
         _save_settings(s)
 
     def _on_close(self) -> None:
@@ -969,6 +976,8 @@ class App:
         self._set_status("All boxes cleared.")
 
     def _run_detection(self, path: str) -> None:
+        img = self._pil_image
+        dbg = self._debug_text_recognition
         def _worker() -> None:
             try:
                 regions = detect_photos(
@@ -977,15 +986,23 @@ class App:
                         0, lambda m=msg: self._set_status(m)
                     ),
                 )
-                self.root.after(0, lambda r=regions: self._on_done(r))
+                self.root.after(0, lambda: self._set_status(
+                    f"Scanning {len(regions)} box(es) for text…"))
+                masked_img, regions, dbg_img = mask_text_in_regions(img, regions, debug=dbg)
+                self.root.after(0, lambda r=regions, m=masked_img, d=dbg_img: self._on_done(r, m, d))
             except Exception as exc:
                 self.root.after(0, lambda e=str(exc): self._on_error(e))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_done(self, regions) -> None:
+    def _on_done(self, regions, masked_image=None, debug_image=None) -> None:
+        # regions and masked_image come pre-processed from the background worker.
+        # Boxes are set and shrunk against the text-masked copy; the canvas
+        # always displays the original self._pil_image.
         self._canvas.set_boxes(regions)
-        self._canvas.shrink_all_to_content()
+        self._canvas.shrink_all_to_content(masked_image)
+        if debug_image is not None:
+            self._show_debug_text_recognition(debug_image)
         boxes = self._canvas.get_boxes()
         self._apply_defaults_to_boxes(boxes)
         self._applied_default_date   = self._default_date_var.get().strip()
@@ -999,6 +1016,36 @@ class App:
             "Double-click to edit metadata · "
             "Right-click for options."
         )
+
+    def _show_debug_text_recognition(self, debug_image) -> None:
+        """Pop up a non-modal window showing the text-recognition debug overlay."""
+        from PIL import ImageTk as _ITk
+        win = tk.Toplevel(self.root)
+        win.title("Debug: Text Recognition  —  green = no text found   red = text found")
+        win.transient(self.root)
+
+        # Scale to fit a reasonable screen area
+        max_w = min(self.root.winfo_screenwidth()  - 80, 1400)
+        max_h = min(self.root.winfo_screenheight() - 80, 900)
+        scale = min(max_w / debug_image.width, max_h / debug_image.height, 1.0)
+        if scale < 1.0:
+            disp = debug_image.resize(
+                (round(debug_image.width * scale), round(debug_image.height * scale)),
+                Image.LANCZOS,
+            )
+        else:
+            disp = debug_image
+
+        photo = _ITk.PhotoImage(disp)
+        lbl = tk.Label(win, image=photo)
+        lbl.image = photo
+        lbl.pack()
+        tk.Button(win, text="Close", command=win.destroy).pack(pady=6)
+
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + 40
+        y = self.root.winfo_rooty() + 40
+        win.geometry(f"+{x}+{y}")
 
     def _on_error(self, msg: str) -> None:
         messagebox.showerror("Detection failed", msg)

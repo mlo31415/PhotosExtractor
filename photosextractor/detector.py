@@ -314,6 +314,184 @@ def _contours_to_regions(
     return out
 
 
+# ── text-masking post-process (called from app after detection) ───────────────
+
+def mask_text_in_regions(
+    pil_image: "_PILImage.Image",
+    regions: List["PhotoRegion"],
+    conf_threshold: int = 10,
+    debug: bool = False,
+) -> "tuple":
+    """
+    Build a copy of *pil_image* with all recognised text painted over with the
+    local background colour, then return (masked_image, surviving_regions).
+
+    Regions whose entire content is text are dropped from the returned list.
+    Regions with surviving photo content are kept at their original coordinates;
+    shrinking is handled separately by canvas.shrink_all_to_content() so the
+    same algorithm is used for both auto-detection and manual shrink.
+
+    If pytesseract is unavailable the function returns (pil_image, regions, None)
+    unchanged so the pipeline degrades gracefully.
+
+    When *debug* is True a third element is returned: a PIL Image with a
+    light-green overlay on areas inside each box where no text was found, and
+    a red overlay on areas where text was detected.  Otherwise the third
+    element is None.
+    """
+    if not (_TESS and _PIL):
+        return pil_image, regions, None
+
+    # Ensure Tesseract is findable on Windows even when not on PATH.
+    try:
+        import os as _os, shutil as _sh
+        if not _sh.which("tesseract"):
+            default = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+            if _os.path.isfile(default):
+                _tess.pytesseract.tesseract_cmd = default
+    except Exception:
+        pass
+
+    iw, ih = pil_image.width, pil_image.height
+    masked_arr = np.array(pil_image.convert("RGB"))
+    surviving: List[PhotoRegion] = []
+    # debug_data: per-region list of (region, [word_bboxes_in_image_coords])
+    debug_data: list = []
+    print(f"[PX text-mask] {len(regions)} region(s) to scan  "
+          f"(conf_threshold={conf_threshold})")
+
+    for region in regions:
+        x1 = max(0, region.x1);  y1 = max(0, region.y1)
+        x2 = min(iw, region.x2); y2 = min(ih, region.y2)
+        cw, ch = x2 - x1, y2 - y1
+        if cw < 10 or ch < 10:
+            surviving.append(region)
+            continue
+
+        # Grayscale crop for background estimation and Tesseract input.
+        crop_gray = np.array(
+            _PILImage.fromarray(masked_arr[y1:y2, x1:x2]).convert("L"),
+            dtype=np.float32,
+        )
+
+        # Background: 90th-percentile of the outer border ring.
+        ring = min(10, max(2, min(cw, ch) // 8))
+        border = np.concatenate([
+            crop_gray[:ring, :].ravel(),  crop_gray[-ring:, :].ravel(),
+            crop_gray[:, :ring].ravel(),  crop_gray[:, -ring:].ravel(),
+        ])
+        bg_level = float(np.percentile(border, 90))
+        bg_fill  = int(bg_level)
+
+        try:
+            data = _tess.image_to_data(
+                _PILImage.fromarray(crop_gray.astype(np.uint8)),
+                config="--psm 11",
+                output_type=_tess.Output.DICT,
+            )
+        except Exception:
+            surviving.append(region)
+            continue
+
+        has_text = False
+        words_found = []
+        region_word_bboxes: list = []
+
+        def _apply_tess_data(d, ty_offset: int = 0) -> None:
+            nonlocal has_text
+            pad = 5
+            for j in range(len(d["text"])):
+                word = str(d["text"][j]).strip()
+                if not word:
+                    continue
+                try:
+                    conf = int(d["conf"][j])
+                except (ValueError, TypeError):
+                    continue
+                words_found.append((word, conf))
+                if conf < conf_threshold:
+                    continue
+                raw_tx  = int(d["left"][j])
+                raw_ty  = int(d["top"][j]) + ty_offset
+                raw_tx2 = raw_tx + int(d["width"][j])
+                raw_ty2 = raw_ty + int(d["height"][j])
+                tx  = max(0,  raw_tx  - pad)
+                ty  = max(0,  raw_ty  - pad)
+                tx2 = min(cw, raw_tx2 + pad)
+                ty2 = min(ch, raw_ty2 + pad)
+                if tx2 > tx and ty2 > ty:
+                    masked_arr[y1 + ty : y1 + ty2, x1 + tx : x1 + tx2] = bg_fill
+                    region_word_bboxes.append((x1 + tx, y1 + ty, x1 + tx2, y1 + ty2))
+                    has_text = True
+
+        _apply_tess_data(data)
+
+        # PSM 11 is conservative on small pure-text crops (e.g. a single year
+        # annotation "1940").  If it found no candidates at all, retry with PSM 6
+        # which treats the crop as a uniform text block and is more reliable there.
+        # We only do this when words_found is completely empty to avoid running
+        # PSM 6 on large mixed photo+text regions where it false-detects halftone
+        # dots as text and causes over-masking.
+        if not words_found:
+            try:
+                d_fb = _tess.image_to_data(
+                    _PILImage.fromarray(crop_gray.astype(np.uint8)),
+                    config="--psm 6",
+                    output_type=_tess.Output.DICT,
+                )
+                _apply_tess_data(d_fb)
+            except Exception:
+                pass
+
+        # Secondary pass: bottom 40 % with block-text mode catches caption lines
+        # that score poorly when the full region (photo + text) is analysed together.
+        bot_h = ch * 2 // 5
+        if bot_h >= 20:
+            try:
+                d2 = _tess.image_to_data(
+                    _PILImage.fromarray(crop_gray[ch - bot_h:].astype(np.uint8)),
+                    config="--psm 6",
+                    output_type=_tess.Output.DICT,
+                )
+                _apply_tess_data(d2, ty_offset=ch - bot_h)
+            except Exception:
+                pass
+
+        print(f"  box ({x1},{y1})-({x2},{y2})  bg={bg_level:.0f}  "
+              f"words={len(words_found)}  masked={has_text}  "
+              + (f"sample={words_found[:5]}" if words_found else ""))
+
+        debug_data.append(((x1, y1, x2, y2), region_word_bboxes))
+
+        if not has_text:
+            surviving.append(region)
+            continue
+
+        # Check whether any photo content survives in the now-masked crop.
+        after = masked_arr[y1:y2, x1:x2].mean(axis=2).astype(np.float32)
+        has_content = (after < bg_level - 20.0).any()
+        print(f"    → has_content={has_content}  "
+              f"({'kept' if has_content else 'DROPPED — pure text'})")
+        if has_content:
+            surviving.append(region)
+
+    print(f"[PX text-mask] {len(surviving)}/{len(regions)} region(s) survived")
+
+    debug_image = None
+    if debug and _PIL and debug_data:
+        from PIL import ImageDraw as _ID
+        overlay = _PILImage.new("RGBA", (iw, ih), (0, 0, 0, 0))
+        draw = _ID.Draw(overlay)
+        for (rx1, ry1, rx2, ry2), word_bboxes in debug_data:
+            draw.rectangle([rx1, ry1, rx2, ry2], fill=(0, 200, 0, 70))
+            for (wx1, wy1, wx2, wy2) in word_bboxes:
+                draw.rectangle([wx1, wy1, wx2, wy2], fill=(220, 0, 0, 120))
+        base = _PILImage.fromarray(masked_arr).convert("RGBA")
+        debug_image = _PILImage.alpha_composite(base, overlay).convert("RGB")
+
+    return _PILImage.fromarray(masked_arr), surviving, debug_image
+
+
 # ── main detection ────────────────────────────────────────────────────────────
 
 def _detect_from_gray(

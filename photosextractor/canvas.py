@@ -1172,10 +1172,13 @@ class ImageCanvas(tk.Frame):
         self._redraw()
         self._notify_change()
 
-    def _apply_shrink(self, box: PhotoBox) -> bool:
+    def _apply_shrink(self, box: PhotoBox, image=None) -> bool:
         """Shrink *box* coordinates in-place. Returns True if the box changed.
-        Does not redraw or notify — callers must do that themselves."""
-        if self._pil_image is None:
+        Does not redraw or notify — callers must do that themselves.
+        *image* overrides self._pil_image (used when shrinking against a
+        text-masked copy rather than the original)."""
+        img = image if image is not None else self._pil_image
+        if img is None:
             return False
         try:
             import numpy as np
@@ -1184,13 +1187,13 @@ class ImageCanvas(tk.Frame):
 
         x1 = max(0, round(box.x1))
         y1 = max(0, round(box.y1))
-        x2 = min(self._pil_image.width,  round(box.x2))
-        y2 = min(self._pil_image.height, round(box.y2))
+        x2 = min(img.width,  round(box.x2))
+        y2 = min(img.height, round(box.y2))
         if x2 - x1 < 10 or y2 - y1 < 10:
             return False
 
         gray = np.array(
-            self._pil_image.crop((x1, y1, x2, y2)).convert("L"),
+            img.crop((x1, y1, x2, y2)).convert("L"),
             dtype=np.float32,
         )
         h, w = gray.shape
@@ -1229,10 +1232,12 @@ class ImageCanvas(tk.Frame):
         self._redraw()
         self._notify_change()
 
-    def shrink_all_to_content(self) -> None:
-        """Shrink every box; one redraw at the end. Called after auto-detection."""
+    def shrink_all_to_content(self, image=None) -> None:
+        """Shrink every box; one redraw at the end. Called after auto-detection.
+        *image* is an optional PIL Image to shrink against (e.g. a text-masked
+        copy); when omitted the canvas's own image is used."""
         for box in self._boxes:
-            self._apply_shrink(box)
+            self._apply_shrink(box, image)
         self._redraw()
 
     def _do_split(self, box: PhotoBox, pos: float, orient: str) -> None:
