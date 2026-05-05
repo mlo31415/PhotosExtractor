@@ -293,6 +293,7 @@ class App:
         self._canvas.set_on_select(self._on_box_selected)
         self._canvas.set_on_new_box(self._on_new_box)
         self._canvas.set_on_change(self._on_canvas_change)
+        self._canvas.set_on_rotate(self._on_rotate)
         self._canvas.set_caption_drop_widget(self._caption_text)
 
     def _build_output_bar(self, parent: tk.Widget) -> None:
@@ -523,6 +524,28 @@ class App:
             self._page_dirty = True
 
     def _on_canvas_change(self) -> None:
+        self._mark_page_dirty()
+
+    def _on_rotate(self, direction: str) -> None:
+        if self._pil_image is None:
+            return
+        W, H = self._pil_image.size
+        if direction == "left":
+            new_img = self._pil_image.transpose(Image.ROTATE_90)
+            def _transform(box) -> None:
+                box.x1, box.y1, box.x2, box.y2 = (
+                    box.y1, W - box.x2, box.y2, W - box.x1,
+                )
+        else:
+            new_img = self._pil_image.transpose(Image.ROTATE_270)
+            def _transform(box) -> None:
+                box.x1, box.y1, box.x2, box.y2 = (
+                    H - box.y2, box.x1, H - box.y1, box.x2,
+                )
+        for box in self._canvas.get_boxes():
+            _transform(box)
+        self._pil_image = new_img
+        self._canvas.replace_image(new_img)
         self._mark_page_dirty()
 
     def _build_info_panel(self, parent: tk.Widget) -> None:

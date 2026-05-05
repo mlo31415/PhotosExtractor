@@ -270,6 +270,7 @@ class ImageCanvas(tk.Frame):
         self._caption_drop_widget: Optional[tk.Widget]         = None   # Caption text widget for OCR drops
         self._on_new_box_callback                               = None   # callable(PhotoBox) fired when a box is added
         self._on_change_callback                                = None   # callable() fired when boxes/metadata change
+        self._on_rotate_callback                                = None   # callable(direction) fired on rotate
         self._drag_ghost: Optional[tk.Toplevel]                 = None   # borderless window that follows cursor off-canvas
 
         self._build_widgets()
@@ -331,9 +332,17 @@ class ImageCanvas(tk.Frame):
         """Register a callable() fired whenever boxes or their metadata change."""
         self._on_change_callback = callback
 
+    def set_on_rotate(self, callback) -> None:
+        """Register a callable(direction) fired when the user selects Rotate Left/Right."""
+        self._on_rotate_callback = callback
+
     def _notify_change(self) -> None:
         if self._on_change_callback is not None:
             self._on_change_callback()
+
+    def _fire_rotate(self, direction: str) -> None:
+        if self._on_rotate_callback is not None:
+            self._on_rotate_callback(direction)
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -343,6 +352,15 @@ class ImageCanvas(tk.Frame):
         self._splits.clear()
         self._rubber_band = None
         self._active = None
+        self._last_deleted = None
+        self.update_idletasks()
+        self._fit()
+
+    def replace_image(self, pil_image: Image.Image) -> None:
+        """Replace the displayed image without clearing boxes (caller pre-transforms coordinates)."""
+        self._pil_image = pil_image
+        self._splits.clear()
+        self._rubber_band = None
         self._last_deleted = None
         self.update_idletasks()
         self._fit()
@@ -855,6 +873,9 @@ class ImageCanvas(tk.Frame):
                 label="Add Box Here",
                 command=lambda x=cx, y=cy: self._add_box_at(x, y),
             )
+            menu.add_separator()
+            menu.add_command(label="Rotate Left",  command=lambda: self._fire_rotate("left"))
+            menu.add_command(label="Rotate Right", command=lambda: self._fire_rotate("right"))
         if menu.index("end") is not None:
             menu.tk_popup(event.x_root, event.y_root)
 
