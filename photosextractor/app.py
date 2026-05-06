@@ -298,8 +298,11 @@ class App:
 
     def _build_output_bar(self, parent: tk.Widget) -> None:
         tk.Button(
-            parent, text="Output Folder:", command=self._choose_output_folder,
+            parent, text="Save All Photos", command=self.save_all,
         ).pack(side=tk.LEFT, padx=(6, 4), pady=4)
+        tk.Button(
+            parent, text="Change Output Folder", command=self._choose_output_folder,
+        ).pack(side=tk.LEFT, padx=(0, 4), pady=4)
         tk.Entry(parent, textvariable=self._output_folder_var).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6), pady=4,
         )
